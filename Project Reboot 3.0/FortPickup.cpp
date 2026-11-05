@@ -1,3 +1,4 @@
+#include "BotRegistry.h"
 #include "FortPickup.h"
 
 #include "FortPawn.h"
@@ -313,7 +314,7 @@ char AFortPickup::CompletePickupAnimationHook(AFortPickup* Pickup)
 	if (!Pawn)
 		return CompletePickupAnimationOriginal(Pickup);
 
-	auto PlayerController = Cast<AFortPlayerController>(Pawn->GetController());
+	auto PlayerController = Cast<AFortPlayerController>(BotRegistry::ControllerFor(Pawn)); // bots have no controller on their pawn
 
 	if (!PlayerController)
 		return CompletePickupAnimationOriginal(Pickup);

@@ -6,7 +6,15 @@ void AFortPlayerPawnAthena::OnCapsuleBeginOverlapHook(UObject* Context, FFrame* 
 {
 	using UPrimitiveComponent = UObject;
 
-	auto Pawn = (AFortPlayerPawnAthena*)Context;
+	// The hook is installed on both FortPlayerPawnAthena and FortPlayerPawn.
+	// Only do Athena-specific logic if the pawn is actually an Athena pawn.
+	auto Pawn = Cast<AFortPlayerPawnAthena>(Context);
+	if (!Pawn)
+	{
+		// Zone pawn (FortPlayerPawn) - call original
+		return OnCapsuleBeginOverlapOriginal(Context, Stack, Ret);
+	}
+
 	UPrimitiveComponent* OverlappedComp;
 	AActor* OtherActor;
 	UPrimitiveComponent* OtherComp;
@@ -40,7 +48,7 @@ void AFortPlayerPawnAthena::OnCapsuleBeginOverlapHook(UObject* Context, FFrame* 
 
 				if (!ItemDefinition)
 				{
-					return;
+					return OnCapsuleBeginOverlapOriginal(Context, Stack, Ret);
 				}
 
 				if (!IsPrimaryQuickbar(ItemDefinition))
@@ -51,5 +59,5 @@ void AFortPlayerPawnAthena::OnCapsuleBeginOverlapHook(UObject* Context, FFrame* 
 		}
 	}
 
-	// return OnCapsuleBeginOverlapOriginal(Context, Stack, Ret); // we love explicit
+	return OnCapsuleBeginOverlapOriginal(Context, Stack, Ret);
 }

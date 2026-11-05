@@ -435,7 +435,7 @@ void AFortPlayerControllerAthena::ServerAcknowledgePossessionHook(APlayerControl
 		PawnAsFort->SetShield(StartingShield);
 	}
 
-	if (Globals::bNoMCP)
+	if (Globals::bNoMCP || Globals::bZoneMode)
 	{
 		static auto CustomCharacterPartClass = FindObject<UClass>(L"/Script/FortniteGame.CustomCharacterPart");
 		static auto backpackPart = LoadObject("/Game/Characters/CharacterParts/Backpacks/NoBackpack.NoBackpack", CustomCharacterPartClass);

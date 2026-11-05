@@ -5,12 +5,14 @@
 #include "NetConnection.h"
 #include "FortPlayerControllerAthena.h"
 #include "GameplayStatics.h"
+#include "ZoneHusks.h"
 #include "KismetMathLibrary.h"
 #include <random>
 #include "Package.h"
 #include "AssertionMacros.h"
 #include "bots.h"
 #include "gui.h"
+#include "prodmatch.h"
 
 enum class EChannelCloseReason : uint8
 {
@@ -60,14 +62,33 @@ void UNetDriver::TickFlushHook(UNetDriver* NetDriver)
 		bShouldDestroyAllPlayerBuilds = false;
 	}
 	
-	/* if (bEnableBotTick)
+	if (ProdMatch::Get().bEnabled)
+	{
+		ProdMatch::Tick();
+	}
+
+	if (Globals::bZoneMode)
+	{
+		Zone::HusksTick();
+	}
+
+	if (bEnableBotTick && !Globals::bZoneMode && RebootConfig::Get().Bots.bEnabled)
 	{
 		Bots::Tick();
-	} */
+	}
 
 	if (Globals::bStartedListening)
 	{
-		if (!Globals::bShouldUseReplicationGraph)
+		BotBrain::SprintStyleBegin();
+
+		// Zone worlds: Replication=native leaves it all to the engine's own TickFlush, Replication=reboot is Reboot's port without the graph
+		const bool bZoneNative = Globals::bZoneMode && RebootConfig::Get().Stw.Replication == "native";
+		const bool bZoneReboot = Globals::bZoneMode && RebootConfig::Get().Stw.Replication == "reboot";
+
+		if (bZoneNative)
+		{
+		}
+		else if (!Globals::bShouldUseReplicationGraph || bZoneReboot)
 		{
 			NetDriver->ServerReplicateActors();
 		}
@@ -75,7 +96,10 @@ void UNetDriver::TickFlushHook(UNetDriver* NetDriver)
 		{
 			static auto ReplicationDriverOffset = NetDriver->GetOffset("ReplicationDriver"/*, false */);
 
-			if (auto ReplicationDriver = NetDriver->Get(ReplicationDriverOffset))
+			// a -1 offset would read before the net driver object: only read through a real offset
+			auto ReplicationDriver = ReplicationDriverOffset != -1 ? NetDriver->Get(ReplicationDriverOffset) : nullptr;
+
+			if (ReplicationDriver)
 			{
 				reinterpret_cast<void(*)(UObject*)>(ReplicationDriver->VFTable[Offsets::ServerReplicateActors])(ReplicationDriver);
 			}
@@ -85,6 +109,8 @@ void UNetDriver::TickFlushHook(UNetDriver* NetDriver)
 			}
 		}
 	}
+
+	BotBrain::SprintStyleEnd();
 
 	return TickFlushOriginal(NetDriver);
 }

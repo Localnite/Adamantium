@@ -1,27 +1,23 @@
-## IMPORTANT: discord.gg/reboot is NOT us anymore!
 
-# New discord at discord.gg/rebootmp
-# Thanks for all the support over the past years.
 
-![Banner](https://i.imgur.com/p0P4tcI.png)
-
-Project Reboot is a tough battled and widely used game server for Fortnite.
+Adamantium is a fork of the widely used Project Reboot game server (commit 10c659028ad9d6816f78226483f11a884bf81f57), featuring QOL features and Save The World Support.
 
 Below are the key points about this project:
 
 ## Features
 
-1. **S3-S15 Support**: The project includes support for Fortnite seasons 3 through 15.
-2. **S1-S2 & S16-S19 Compatibility**: Seasons 1 and 2, and Season 16 through 19 might not work perfectly.
-3. **S20+ Branch**: We have an alternate branch if you really want to test S20. It is currently unstable though.
-4. **Rewrite and Improvements**: Project Reboot is a rewrite of the original Universal Walking Simulator. It's an ongoing effort to enhance and optimize the gameplay experience.
-5. **Lategame Enhancements**: Although still missing some features from the old project, lategame improvements are planned for the future.
+1. **Experimental Bot Support**: The project includes experimental rule-based AI bots. (only tested on S7 v7.00-.30, may not work well or at all on older seasons.)
+2. **Experimental Save The World Support**: Experimental STW support is included, results may vary.
+
+
+All existing features from Project Reboot carry over.
+
 
 ## Installation
 
-1. Clone this repository: `git clone https://github.com/Milxnor/Project-Reboot-3.0.git`
+1. Clone this repository: `git clone https://github.com/Localnite/Adamantium`
 2. Build the project using your preferred build tools. (Use Visual Studio 2022)
-3. Run the server using the Reboot Launcher.
+3. Run the server using your preferred launcher.
 ## Contributing
 
 Contributions are welcome! Feel free to create pull requests or report issues on the GitHub repository.
@@ -32,4 +28,4 @@ This project is licensed under the BSD-3-Clause license.
 
 ---
 
-**Note**: Project Reboot is a work in progress, and further updates and enhancements are planned. Explore, experiment, and contribute to make it even better! 🚀
+**Note**: Adamantium is a work in progress, and further updates and enhancements are planned. Explore, experiment, and contribute to make it even better! 🚀

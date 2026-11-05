@@ -17,11 +17,18 @@ bool ABuildingContainer::SpawnLoot(AFortPawn* Pawn)
 
 	FVector LocationToSpawnLoot = this->GetActorLocation() + this->GetActorForwardVector() * this->GetLootSpawnLocation_Athena().X + this->GetActorRightVector() * this->GetLootSpawnLocation_Athena().Y + this->GetActorUpVector() * this->GetLootSpawnLocation_Athena().Z;
 
-	auto RedirectedLootTier = GameMode->RedirectLootTier(GetSearchLootTierGroup());
-
-	// LOG_INFO(LogInteraction, "RedirectedLootTier: {}", RedirectedLootTier.ToString());
-
 	auto GameState = Cast<AFortGameStateAthena>(GetWorld()->GetGameState());
+
+	// The Zone (Save the World) uses GameModeZone/FortGameStateZone, so both casts here are null and the untick'd
+	// RedirectLootTier/GetWorldLevel calls crashed the server the moment a player searched a container (2026-11-03).
+	// The Athena loot tables do not fit the STW container's LootTierGroup anyway, so skip picking there.
+	if (!GameMode || !GameState)
+	{
+		LOG_INFO(LogDev, "Zone: ABuildingContainer::SpawnLoot skipped (GameMode/GameState not Athena): {}", GetFullName());
+		return true;
+	}
+
+	auto RedirectedLootTier = GameMode->RedirectLootTier(GetSearchLootTierGroup());
 
 	auto LootDrops = PickLootDrops(RedirectedLootTier, GameState->GetWorldLevel(), -1, bDebugPrintLooting);
 

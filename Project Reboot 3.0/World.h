@@ -155,7 +155,7 @@ public:
 	void Listen();
 };
 #else
-// #define USE_VIRTUALALLOC_SPAWNPARAMS
+#define USE_VIRTUALALLOC_SPAWNPARAMS
 
 static inline void* CreateSpawnParameters(ESpawnActorCollisionHandlingMethod SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::Undefined, bool bDeferConstruction = false, UObject* Owner = nullptr)
 {

@@ -40,6 +40,8 @@
 
 static UFortPlaylistAthena* GetPlaylistToUse()
 {
+	Bots::TestOptions(); // reads -BOT_PLAYLIST before the playlist is looked up
+
 	// LOG_DEBUG(LogDev, "PlaylistName: {}", PlaylistName);
 
 	auto Playlist = FindObject<UFortPlaylistAthena>(PlaylistName);
@@ -957,7 +959,7 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 
 		AllRebootVans.Free();
 
-		if (AmountOfBotsToSpawn != 0)
+		if (RebootConfig::Get().Bots.bEnabled && !Bots::FillMode() && (AmountOfBotsToSpawn != 0 || Bots::TestOptions().BotCount > 0))
 		{
 			Bots::SpawnBotsAtPlayerStarts(AmountOfBotsToSpawn);
 		}
@@ -1071,6 +1073,14 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 	if (!Ret)
 		Ret = Athena_ReadyToStartMatchOriginal(GameMode);
 
+	// bot test mode: no player will ever press ready, so once the bots exist the match may start
+	if (!Ret && Bots::TestOptions().bEnabled && (!AllPlayerBotsToTick.empty() || Bots::TestOptions().FillTotal > 0))
+		Ret = true;
+
+	// backend-run server: the join window is over, so the match starts without anybody pressing a button
+	if (!Ret && ProdMatch::Get().bEnabled && ProdMatch::gAllowStart)
+		Ret = true;
+
 	if (Ret)
 	{
 		LOG_INFO(LogDev, "Athena_ReadyToStartMatchOriginal RET!"); // if u dont see this, not good
@@ -1118,7 +1128,7 @@ int AFortGameModeAthena::Athena_PickTeamHook(AFortGameModeAthena* GameMode, uint
 		Playlist = CurrentPlaylistDataOffset == -1 && Fortnite_Version < 6 ? nullptr : GameState->GetCurrentPlaylist();
 	}
 
-	static int DefaultFirstTeam = 3;
+	static int DefaultFirstTeam = PlaylistFirstTeam(Playlist);
 
 	bool bShouldSpreadTeams = false;
 
@@ -1205,7 +1215,7 @@ int AFortGameModeAthena::Athena_PickTeamHook(AFortGameModeAthena* GameMode, uint
 
 		if (CurrentTeamMembers >= 1) // We spread every player.
 		{
-			if (Idx >= TeamsNum)
+			if (NextTeamIndex - DefaultFirstTeam + 1 >= TeamsNum) // the last team: back to the first
 				NextTeamIndex = DefaultFirstTeam;
 			else
 				NextTeamIndex++;
@@ -1589,6 +1599,8 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 	GameState->AddPlayerStateToGameMemberInfo(PlayerStateAthena);
 
 	LOG_INFO(LogDev, "New player going on TeamIndex {} with SquadId {}", PlayerStateAthena->GetTeamIndex(), SquadIdOffset != -1 ? PlayerStateAthena->GetSquadId() : -1);
+
+	Bots::EvictBotOnTeam((int)PlayerStateAthena->GetTeamIndex(), PlayerStateAthena);
 
 #if 0
 	if (Fortnite_Version < 14) // Fixes LS not dropping // Probably not needed on any build

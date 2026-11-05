@@ -1,3 +1,4 @@
+#include "BotRegistry.h"
 #include "FortPlayerController.h"
 
 #include "Rotator.h"
@@ -12,6 +13,7 @@
 #include "globals.h"
 #include "FortPlayerControllerAthena.h"
 #include "BuildingContainer.h"
+#include "ZoneSearch.h"
 #include "FortLootPackage.h"
 #include "FortPickup.h"
 #include "FortPlayerPawn.h"
@@ -24,6 +26,7 @@
 #include "gui.h"
 #include "FortAthenaMutator_InventoryOverride.h"
 #include "FortAthenaMutator_TDM.h"
+#include "reboot.h"
 
 void AFortPlayerController::ClientReportDamagedResourceBuilding(ABuildingSMActor* BuildingSMActor, EFortResourceType PotentialResourceType, int PotentialResourceCount, bool bDestroyed, bool bJustHitWeakspot)
 {
@@ -431,8 +434,8 @@ void AFortPlayerController::ServerAttemptInteractHook(UObject* Context, FFrame* 
 
 	static bool bIsUsingComponent = FindObject<UClass>(L"/Script/FortniteGame.FortControllerComponent_Interaction");
 
-	AFortPlayerControllerAthena* PlayerController = bIsUsingComponent ? Cast<AFortPlayerControllerAthena>(((UActorComponent*)Context)->GetOwner()) :
-		Cast<AFortPlayerControllerAthena>(Context);
+	AFortPlayerController* PlayerController = bIsUsingComponent ? Cast<AFortPlayerController>(((UActorComponent*)Context)->GetOwner()) :
+		Cast<AFortPlayerController>(Context);
 
 	if (!PlayerController)
 		return;
@@ -440,6 +443,10 @@ void AFortPlayerController::ServerAttemptInteractHook(UObject* Context, FFrame* 
 	std::string StructName = bIsUsingComponent ? "/Script/FortniteGame.FortControllerComponent_Interaction.ServerAttemptInteract" : "/Script/FortniteGame.FortPlayerController.ServerAttemptInteract";
 
 	static auto ReceivingActorOffset = FindOffsetStruct(StructName, "ReceivingActor");
+	// a missing field would read through -1 into the params before the struct: give up instead
+	if (ReceivingActorOffset == -1)
+		return;
+
 	auto ReceivingActor = *(AActor**)(__int64(Params) + ReceivingActorOffset);
 
 	// LOG_INFO(LogInteraction, "ReceivingActor: {}", __int64(ReceivingActor));
@@ -460,7 +467,7 @@ void AFortPlayerController::ServerAttemptInteractHook(UObject* Context, FFrame* 
 		static auto SearchBounceDataOffset = BuildingContainer->GetOffset("SearchBounceData");
 		static auto bAlreadySearchedFieldMask = GetFieldMask(BuildingContainer->GetProperty("bAlreadySearched"));
 		
-		auto SearchBounceData = BuildingContainer->GetPtr<void>(SearchBounceDataOffset);
+		auto SearchBounceData = SearchBounceDataOffset != -1 ? BuildingContainer->GetPtr<void>(SearchBounceDataOffset) : nullptr;
 
 		if (BuildingContainer->ReadBitfieldValue(bAlreadySearchedOffset, bAlreadySearchedFieldMask))
 			return;
@@ -469,17 +476,30 @@ void AFortPlayerController::ServerAttemptInteractHook(UObject* Context, FFrame* 
 
 		BuildingContainer->SpawnLoot(PlayerController->GetMyFortPawn());
 
+		// The Zone loot tables don't exist for the Athena picker, so STW containers get zone loot through the
+		// Zone:: search chunk (the onboarding pistol itself comes with the starter kit since Build57)
+		if (Globals::bZoneMode)
+			Zone::SearchContainerSpawnLoot(BuildingContainer, PlayerController);
+
 		BuildingContainer->SetBitfieldValue(bAlreadySearchedOffset, bAlreadySearchedFieldMask, true);
-		(*(int*)(__int64(SearchBounceData) + SearchAnimationCountOffset))++;
+		if (SearchBounceData && SearchAnimationCountOffset != -1)
+			(*(int*)(__int64(SearchBounceData) + SearchAnimationCountOffset))++;
 		BuildingContainer->BounceContainer();
 
-		BuildingContainer->ForceNetUpdate(); // ?
+		BuildingContainer->ForceNetUpdate();
 
-		static auto OnRep_bAlreadySearchedFn = FindObject<UFunction>(L"/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched");
-		// BuildingContainer->ProcessEvent(OnRep_bAlreadySearchedFn);
-
-		// if (BuildingContainer->ShouldDestroyOnSearch())
-			// BuildingContainer->K2_DestroyActor();
+		// Tutorial chests and searchable props should be destroyed after searching in STW
+		if (BuildingContainer->ShouldDestroyOnSearch())
+		{
+			BuildingContainer->K2_DestroyActor();
+			LOG_INFO(LogDev, "Zone: destroyed searched container {}", BuildingContainer->GetName());
+		}
+		else
+		{
+			static auto OnRep_bAlreadySearchedFn = FindObject<UFunction>(L"/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched");
+			if (OnRep_bAlreadySearchedFn)
+				BuildingContainer->ProcessEvent(OnRep_bAlreadySearchedFn);
+		}
 	}
 	else if (ReceivingActor->IsA(FortAthenaVehicleClass))
 	{
@@ -979,7 +999,8 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 	// BuildingActor->SetCurrentBuildingLevel()
 	BuildingActor->SetPlayerPlaced(true);
 	BuildingActor->InitializeBuildingActor(PlayerController, BuildingActor, true);
-	BuildingActor->SetTeam(PlayerStateAthena->GetTeamIndex()); // required?
+	if (Cast<AFortPlayerStateAthena>(PlayerController->GetPlayerState()))
+		BuildingActor->SetTeam(PlayerStateAthena->GetTeamIndex()); // required?
 
 	/*
 
@@ -1333,7 +1354,7 @@ void AFortPlayerController::ClientOnPawnDiedHook(AFortPlayerController* PlayerCo
 
 		LOG_INFO(LogDev, "DeathCause: {}", (int)DeathCause);
 		LOG_INFO(LogDev, "DeadPawn->IsDBNO(): {}", DeadPawn->IsDBNO());
-		LOG_INFO(LogDev, "KillerPlayerState: {}", __int64(KillerPlayerState));
+		LOG_INFO(LogDev, "KillerPlayerState: {} -> {}", __int64(KillerPlayerState), BotRegistry::LabelFor(KillerPlayerState));
 
 		*(bool*)(__int64(DeathInfo) + MemberOffsets::DeathInfo::bDBNO) = DeadPawn->IsDBNO();
 		*(uint8*)(__int64(DeathInfo) + MemberOffsets::DeathInfo::DeathCause) = DeathCause;
@@ -1639,8 +1660,21 @@ void AFortPlayerController::ClientOnPawnDiedHook(AFortPlayerController* PlayerCo
 				{
 					LOG_INFO(LogDev, "Starting Spectating!");
 
+					// a bot's kill does not always fill the death report's pawn: use the killer's player state's pawn then
+					APawn* ToSpectate = KillerPawn;
+
+					if (!ToSpectate && KillerPlayerState && KillerPlayerState != DeadPlayerState)
+					{
+						static auto PawnPrivateOffset = KillerPlayerState->GetOffset("PawnPrivate", false);
+
+						if (PawnPrivateOffset != -1)
+							ToSpectate = KillerPlayerState->Get<APawn*>(PawnPrivateOffset);
+					}
+
+					LOG_INFO(LogDev, "Spectating the killer: death report pawn {} -> using {}", (void*)KillerPawn, (void*)ToSpectate);
+
 					static auto PlayerToSpectateOnDeathOffset = PlayerController->GetOffset("PlayerToSpectateOnDeath");
-					PlayerController->Get<APawn*>(PlayerToSpectateOnDeathOffset) = KillerPawn;
+					PlayerController->Get<APawn*>(PlayerToSpectateOnDeathOffset) = ToSpectate;
 
 					UKismetSystemLibrary::K2_SetTimer(PlayerController, L"SpectateOnDeath", 5.f, false); // Soo proper its scary
 				}

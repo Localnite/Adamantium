@@ -34,7 +34,7 @@ inline void MakeLogger(const std::string& LoggerName)
     spdlog::register_logger(logger);
 
     logger->set_level(spdlog::level::level_enum::info);
-    logger->flush_on(spdlog::level::level_enum::info);
+    logger->flush_on(spdlog::level::level_enum::warn); // flushing every info line (file and console) cost about 2 ms each under Wine; a timer flushes the rest
 }
 
 inline void InitLogger()
@@ -61,7 +61,9 @@ inline void InitLogger()
 
     std::string logName = "reboot.log"; // GenerateLogFileName();
 
-    sinks.emplace_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>())->set_pattern("[%D-%T] %n: %^%v%$");
+    auto& ConsoleSink = sinks.emplace_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
+    ConsoleSink->set_pattern("[%D-%T] %n: %^%v%$");
+    ConsoleSink->set_level(spdlog::level::level_enum::warn); // the console is slow under Wine; everything is in reboot.log anyway
     sinks.emplace_back(std::make_shared<spdlog::sinks::basic_file_sink_mt>(logName, true))->set_pattern("[%D-%T] %n: %l: %v");
 
     MakeLogger("LogTeams");
@@ -93,6 +95,8 @@ inline void InitLogger()
     MakeLogger("LogRebooting");
     MakeLogger("LogObjectViewer");
     MakeLogger("LogLateGame");
+
+    spdlog::flush_every(std::chrono::seconds(1));
 #endif
 }
 

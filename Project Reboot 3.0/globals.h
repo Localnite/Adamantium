@@ -21,6 +21,7 @@ namespace Globals
 	extern inline bool bHitReadyToStartMatch = false;
 	extern inline bool bInitializedPlaylist = false;
 	extern inline bool bStartedListening = false;
+	extern inline bool bZoneMode = false; // the server is on a Save the World (Zone) map: no Athena bots or bot brain
 	extern inline bool bAutoRestart = false; // doesnt work fyi
 	extern inline bool bFillVendingMachines = true;
 	extern inline bool bPrivateIPsAreOperator = true;

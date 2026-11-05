@@ -189,6 +189,8 @@
     <ClCompile Include="BP_IslandScripting.cpp" />
     <ClCompile Include="BuildingActor.cpp" />
     <ClCompile Include="BuildingContainer.cpp" />
+    <ClCompile Include="ZoneSearch.cpp" />
+    <ClCompile Include="ZoneHusks.cpp" />
     <ClCompile Include="BuildingFoundation.cpp" />
     <ClCompile Include="BuildingGameplayActorSpawnMachine.cpp" />
     <ClCompile Include="BuildingSMActor.cpp" />
@@ -306,6 +308,8 @@
     <ClInclude Include="BP_IslandScripting.h" />
     <ClInclude Include="BuildingActor.h" />
     <ClInclude Include="BuildingContainer.h" />
+    <ClInclude Include="ZoneSearch.h" />
+    <ClInclude Include="ZoneHusks.h" />
     <ClInclude Include="BuildingFoundation.h" />
     <ClInclude Include="BuildingGameplayActor.h" />
     <ClInclude Include="BuildingGameplayActorSpawnMachine.h" />

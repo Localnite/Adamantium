@@ -544,10 +544,10 @@ AFortPickup* UFortKismetLibrary::K2_SpawnPickupInWorldWithClassHook(UObject* Con
 
 UObject* UFortKismetLibrary::GetAIDirectorHook(UObject* Context, FFrame& Stack, UObject** Ret)
 {
-	auto GameMode = Cast<AFortGameModeAthena>(GetWorld()->GetGameMode());
-	static auto AIDirectorOffset = GameMode->GetOffset("AIDirector");
+	auto GameMode = GetWorld() ? (UObject*)GetWorld()->GetGameMode() : nullptr;
+	static auto AIDirectorOffset = GameMode ? GameMode->GetOffset("AIDirector", false) : -1;
 
-	auto AIDirector = GameMode->Get(AIDirectorOffset);
+	auto AIDirector = (GameMode && AIDirectorOffset != -1) ? GameMode->Get<UObject*>(AIDirectorOffset) : nullptr;
 
 	GetAIDirectorOriginal(Context, Stack, Ret);
 
@@ -557,10 +557,10 @@ UObject* UFortKismetLibrary::GetAIDirectorHook(UObject* Context, FFrame& Stack, 
 
 UObject* UFortKismetLibrary::GetAIGoalManagerHook(UObject* Context, FFrame& Stack, UObject** Ret)
 {
-	auto GameMode = Cast<AFortGameModeAthena>(GetWorld()->GetGameMode());
-	static auto AIGoalManagerOffset = GameMode->GetOffset("AIGoalManager");
+	auto GameMode = GetWorld() ? (UObject*)GetWorld()->GetGameMode() : nullptr;
+	static auto AIGoalManagerOffset = GameMode ? GameMode->GetOffset("AIGoalManager", false) : -1;
 
-	auto GoalManager = GameMode->Get(AIGoalManagerOffset);
+	UObject* GoalManager = (GameMode && AIGoalManagerOffset != -1) ? GameMode->Get<UObject*>(AIGoalManagerOffset) : nullptr;
 
 	GetAIGoalManagerOriginal(Context, Stack, Ret);
 

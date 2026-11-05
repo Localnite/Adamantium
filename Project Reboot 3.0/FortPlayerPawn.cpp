@@ -348,6 +348,10 @@ void AFortPlayerPawn::ServerHandlePickupHook(AFortPlayerPawn* Pawn, AFortPickup*
 	if (PlayerControllerAthena && PlayerControllerAthena->IsInGhostMode())
 		return;
 
+	// STW only: confirms a player's pickup request reached the server (search loot and resource pickups)
+	if (Globals::bZoneMode)
+		LOG_INFO(LogDev, "Zone: pickup requested by a player: {}", Pickup->GetFullName());
+
 	static auto IncomingPickupsOffset = Pawn->GetOffset("IncomingPickups");
 	Pawn->Get<TArray<AFortPickup*>>(IncomingPickupsOffset).Add(Pickup);
 

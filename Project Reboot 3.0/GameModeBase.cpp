@@ -1,3 +1,4 @@
+#include "BotRegistry.h"
 #include "GameModeBase.h"
 
 #include "reboot.h"
@@ -105,6 +106,17 @@ bool AGameModeBase::PlayerCanRestartHook(UObject* Context, FFrame& Stack, bool* 
 
 APawn* AGameModeBase::SpawnDefaultPawnForHook(AGameModeBase* GameMode, AController* NewPlayer, AActor* StartSpot)
 {
+	if (BotRegistry::IsBotController(NewPlayer))
+	{
+		// Bots already own a pawn that runs without a controller; a second, possessed one would break their simulation.
+		static int Refused = 0;
+
+		if (++Refused <= 5)
+			LOG_INFO(LogBots, "SpawnDefaultPawnFor refused for a bot controller");
+
+		return nullptr;
+	}
+
 	LOG_INFO(LogDev, "SpawnDefaultPawnForHook!");
 
 	auto NewPlayerAsAthena = Cast<AFortPlayerControllerAthena>(NewPlayer);

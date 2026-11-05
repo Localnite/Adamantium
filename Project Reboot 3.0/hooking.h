@@ -349,6 +349,25 @@ namespace Hooking
 
                 VirtualSwap(DefaultClass->VFTable, Idx, Detour); // we should loop thrugh all objects and check if they inherit from the DefaultClass if so also swap that
 
+                if (DefaultClass == FindObject(L"/Script/FortniteGame.Default__FortPlayerControllerAthena"))
+                {
+                    for (auto SubPath : {
+                        L"/Script/FortniteGame.Default__FortPlayerController",
+                        L"/Script/FortniteGame.Default__FortPlayerControllerGameplay",
+                        L"/Script/FortniteGame.Default__FortPlayerControllerZone",
+                        L"/Script/FortniteGame.Default__FortPlayerControllerPvE",
+                        L"/Script/FortniteGame.Default__FortPlayerControllerOutpost" })
+                    {
+                        if (auto SubDefault = FindObject(SubPath))
+                            VirtualSwap(SubDefault->VFTable, Idx, Detour);
+                    }
+                }
+                else if (DefaultClass == FindObject(L"/Script/FortniteGame.Default__FortPlayerPawnAthena"))
+                {
+                    if (auto SubDefault = FindObject(L"/Script/FortniteGame.Default__FortPlayerPawn"))
+                        VirtualSwap(SubDefault->VFTable, Idx, Detour);
+                }
+
                 return true;
             }
 

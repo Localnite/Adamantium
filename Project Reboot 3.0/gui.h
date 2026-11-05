@@ -85,10 +85,10 @@ extern inline int NumRequiredPlayersToStart = 2;
 extern inline bool bDebugPrintLooting = false;
 extern inline bool bDebugPrintFloorLoot = false;
 extern inline bool bDebugPrintSwapping = false;
-extern inline bool bEnableBotTick = false;
+extern inline bool bEnableBotTick = true;
 extern inline bool bZoneReversing = false;
 extern inline bool bEnableCombinePickup = false;
-extern inline int AmountOfBotsToSpawn = 0;
+extern inline int AmountOfBotsToSpawn = 1;
 extern inline int WarmupRequiredPlayerCount = 1;
 extern inline bool bEnableRebooting = false;
 extern inline bool bEngineDebugLogs = false;
@@ -343,7 +343,7 @@ static inline void StaticUI()
 		}
 	}
 
-	// ImGui::InputInt("Amount of bots to spawn", &AmountOfBotsToSpawn);
+	ImGui::InputInt("Amount of bots to spawn", &AmountOfBotsToSpawn);
 
 	ImGui::Checkbox("Infinite Ammo", &Globals::bInfiniteAmmo);
 	ImGui::Checkbox("Infinite Materials", &Globals::bInfiniteMaterials);
