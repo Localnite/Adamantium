@@ -373,8 +373,11 @@ struct BotBrainState
 	FVector CoverPos{};          // somewhere out of the enemy's sight it is running to
 	float CoverUntil = 0.0f;
 	float NextCoverAt = 0.0f;
-	void* AwareOf = nullptr;     // whom it is getting to notice
-	float Awareness = 0.0f;      // 0 nothing, 1 has noticed
+	// How far it has got to noticing each enemy near it (0 nothing, 1 has noticed). One value per enemy: with a single value that restarted
+	// whenever the candidate changed, two enemies close by wiped each other's progress every frame and a bot next to a real player took
+	// ~20 s to notice them (2026-11-09).
+	struct FAwareOf { void* Pawn; float Value; float Updated; };
+	std::vector<FAwareOf> AwareOf;
 	float PerceptLast = 0.0f;
 	float Alertness = -1.0f;     // how sharp this bot's senses are
 	std::vector<uint8_t> NavJump;   // parallel to NavPath: the way to that waypoint is a hop
@@ -417,6 +420,9 @@ struct BotBrainState
 	// temperament and memory of fights
 	float Aggression = -1.0f;                 // how readily it picks a fight with somebody it merely sees (0..1)
 	float IgnoreUntil = 0.0f;                 // having decided not to fight the enemy it sees, it leaves them alone until then
+	float IgnoredAtDist = 0.0f;               // how far away the enemy was when it decided that
+	float IgnoredAt = -100.0f;                // when
+	bool bIgnoredLostSight = false;           // the ignored enemy has been out of sight since
 	float DecidedAt = -100.0f;                // when it last made that decision
 	float HurtAt = -100.0f;                   // last time something other than the storm hurt it
 	std::vector<std::pair<AFortPickup*, float>> BadPickups; // pickups it could not reach (until when to ignore them)
@@ -494,6 +500,7 @@ struct BotObservation
 	float EnemyDist = 1e9f;
 	bool bEnemyVisible = false;
 	bool bEnemyIsHuman = false;
+	bool bEnemyAimingAtMe = false;   // a real player is pointing at this bot
 	bool bProjectile = false;        // something fast is flying at this bot
 	float ProjTime = 99.0f;          // seconds until it gets here
 	float ProjDirX = 0.0f, ProjDirY = 0.0f;
@@ -552,6 +559,8 @@ struct BotPawnInfo
 	int WeaponScore = 0;
 	float Speed = 0.0f;      // how fast it moved since the last scan
 	float LastFired = -100.0f; // when its weapon last made a noise
+	float AimYaw = 0.0f;       // where a real player is looking (not read for bots)
+	bool bAimKnown = false;
 };
 
 struct BotPickupInfo
@@ -3540,6 +3549,26 @@ namespace BotBrain
 				Info.Health = Pawn->GetHealth();
 				Info.Shield = Pawn->GetShield();
 
+				// where a real player is looking: a bot being aimed at by somebody it chose to ignore thinks again
+				if (!Info.bIsBot)
+				{
+					static auto GetControlRotationFn = FindObject<UFunction>(L"/Script/Engine.Pawn.GetControlRotation");
+					FRotator Aim{};
+
+					if (GetControlRotationFn)
+					{
+						struct { FRotator ReturnValue; } Params{};
+						Pawn->ProcessEvent(GetControlRotationFn, &Params);
+						Aim = Params.ReturnValue;
+					}
+
+					if (Aim.Yaw == 0.0f && Aim.Pitch == 0.0f)
+						Aim = Pawn->GetActorRotation();
+
+					Info.AimYaw = Aim.Yaw;
+					Info.bAimKnown = true;
+				}
+
 				if (auto HeldWeapon = Pawn->GetCurrentWeapon())
 				{
 					const auto& HeldInfo = GetItemInfo((UObject*)HeldWeapon->GetWeaponData());
@@ -3654,6 +3683,14 @@ namespace BotBrain
 		return Pawn->Get<UObject*>(CharacterMovementOffset);
 	}
 
+	// Reads a bitfield property straight from memory (no engine call, so it is safe on a pawn the engine is tearing down).
+	inline int GetPawnBitOn(UObject* Object, const char* Name)
+	{
+		const int Offset = Object->GetOffset(Name, false);
+		auto Prop = Object->GetProperty(Name, false);
+		return Offset != -1 && Prop ? (int)Object->ReadBitfieldValue(Offset, GetFieldMask(Prop)) : -1;
+	}
+
 	// Sets a bitfield property directly (no OnRep call).
 	inline void SetPawnBitOn(UObject* Object, const char* Name, bool bValue)
 	{
@@ -3691,9 +3728,21 @@ namespace BotBrain
 		if (!bBotGliderVisuals)
 			return;
 
+		// 1.x: a skydiving pawn's own tick opens the parachute near the ground (custom movement mode 2), and that code plays the glider's
+		// OpenSound from Pawn->CustomizationLoadout.Glider (pawn+0x1698 on 1.10). Bots get a glider in PlayerBot::GiveGlider; without one
+		// the server crashed at the first bot parachute (1.10, 2026-11-08 23:30 and 23:35), so a bot that has none only shows a plain fall.
+		if (Fortnite_Version < 2)
+		{
+			static int LoadoutOffset = Pawn->GetOffset("CustomizationLoadout", false);
+			static int GliderOffset = FindOffsetStruct("/Script/FortniteGame.FortAthenaLoadout", "Glider", false);
+
+			if (LoadoutOffset == -1 || GliderOffset == -1 || !*(UObject**)(__int64(Pawn) + LoadoutOffset + GliderOffset))
+				return;
+		}
+
 		SetPawnBit(Pawn, "bIsSkydiving", bSkydiving);
-		SetPawnBit(Pawn, "bIsParachuteOpen", bParachute);
 		CallOnRep(Pawn, L"/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving", !bSkydiving);
+		SetPawnBit(Pawn, "bIsParachuteOpen", bParachute);
 		CallOnRep(Pawn, L"/Script/FortniteGame.FortPlayerPawn.OnRep_IsParachuteOpen", !bParachute);
 	}
 
@@ -4339,32 +4388,57 @@ namespace BotBrain
 				if (C.Info->Speed > 700.0f) Boost *= 1.2f;
 				if (Obs.Now - C.Info->LastFired < 1.5f && C.Distance < 3500.0f) Boost *= 3.0f;
 
-				// switching to a different target starts the noticing again (unless something is shooting at the bot)
-				if (Brain.AwareOf != (void*)C.Info->Pawn)
+				// each enemy is noticed on its own; somebody new starts from nothing (unless something is shooting at the bot), and an enemy
+				// not seen for 10 s is forgotten
+				std::erase_if(Brain.AwareOf, [&](const BotBrainState::FAwareOf& A) { return Obs.Now - A.Updated > 10.0f; });
+
+				auto Found = std::find_if(Brain.AwareOf.begin(), Brain.AwareOf.end(), [&](const BotBrainState::FAwareOf& A) { return A.Pawn == (void*)C.Info->Pawn; });
+
+				if (Found == Brain.AwareOf.end())
 				{
-					Brain.AwareOf = (void*)C.Info->Pawn;
-					Brain.Awareness = Obs.Now - Brain.HurtAt < 3.0f ? 1.2f : 0.0f;
+					Brain.AwareOf.push_back({ (void*)C.Info->Pawn, Obs.Now - Brain.HurtAt < 3.0f ? 1.2f : 0.0f, Obs.Now });
+					Found = Brain.AwareOf.end() - 1;
 				}
+
+				float& Awareness = Found->Value;
+				Found->Updated = Obs.Now;
 
 				const float NoticeTime = 0.2f + C.Distance / 2400.0f;
 				const float Rate = Visible * Field * Boost / NoticeTime * (Brain.Alertness > 0.0f ? Brain.Alertness : 1.0f);
 
 				if (Rate > 0.0f)
-					Brain.Awareness = (std::min)(1.5f, Brain.Awareness + Rate * PerceptDt);
+					Awareness = (std::min)(1.5f, Awareness + Rate * PerceptDt);
 				else
-					Brain.Awareness = (std::max)(0.0f, Brain.Awareness - 0.3f * PerceptDt);
+					Awareness = (std::max)(0.0f, Awareness - 0.3f * PerceptDt);
 
 				// hurt by somebody it can see nothing of: it knows where from
 				if (Obs.Now - Brain.HurtAt < 3.0f && C.Distance < 4500.0f)
-					Brain.Awareness = 1.5f;
+					Awareness = 1.5f;
 
-				const bool bNoticed = Brain.Awareness >= 1.0f && Visible > 0.0f;
+				const bool bNoticed = Awareness >= 1.0f && Visible > 0.0f;
 
 				if (bNoticed)
 				{
-					Chosen = &C; // the nearest one it has noticed is the one it deals with
-					ChosenVisible = 1.0f;
-					break;
+					// the nearest one it has noticed is the one it deals with, except that a real player it has noticed comes first unless the
+					// other enemy is much closer: a bot brawling with another bot right next to a player otherwise never turned to the player
+					if (ChosenVisible <= 0.0f)
+					{
+						Chosen = &C;
+						ChosenVisible = 1.0f;
+
+						if (!C.Info->bIsBot)
+							break;
+
+						continue; // look on for a real player among the others
+					}
+
+					if (!C.Info->bIsBot && Chosen->Distance > C.Distance * 0.5f)
+					{
+						Chosen = &C;
+						break;
+					}
+
+					continue;
 				}
 
 				if (!Chosen)
@@ -4386,6 +4460,16 @@ namespace BotBrain
 				Obs.EnemyShield = Other.Shield;
 				Obs.EnemyWeaponScore = Other.WeaponScore;
 				Obs.bEnemyVisible = ChosenVisible > 0.0f;
+
+				// pointing at this bot: within about a body width of it (wider up close), at a distance a shot could matter
+				if (Other.bAimKnown && Chosen->Distance < 3500.0f)
+				{
+					float Bearing = std::atan2(Obs.Pos.Y - Other.Pos.Y, Obs.Pos.X - Other.Pos.X) * RadToDeg;
+					float Off = std::fmod(std::fabs(Bearing - Other.AimYaw), 360.0f);
+					Off = Off > 180.0f ? 360.0f - Off : Off;
+					const float Allowed = std::atan2(60.0f, (std::max)(Chosen->Distance, 1.0f)) * RadToDeg + 4.0f;
+					Obs.bEnemyAimingAtMe = Off < Allowed;
+				}
 			}
 		}
 
@@ -6269,9 +6353,13 @@ namespace BotBrain
 		}
 
 		// the lobby is thinning out too fast and nobody has hurt this bot: it lets the other one go
-		if (Obs.Governor < 0.3f && Obs.Now - Brain.HurtAt > 6.0f && Obs.Now - Brain.StateSince > 2.0f && Obs.Health + Obs.Shield > 50.0f)
+		// (the governor paces bot-against-bot fights; a real player is never let go because of it)
+		if (!Obs.bEnemyIsHuman && Obs.Governor < 0.3f && Obs.Now - Brain.HurtAt > 6.0f && Obs.Now - Brain.StateSince > 2.0f && Obs.Health + Obs.Shield > 50.0f)
 		{
 			Brain.IgnoreUntil = Obs.Now + RandRange(25.0f, 50.0f);
+			Brain.IgnoredAtDist = Obs.EnemyDist;
+			Brain.IgnoredAt = Obs.Now;
+			Brain.bIgnoredLostSight = false;
 			SetState(Brain, EBotBrainState::Ground, Obs.Now, Id);
 			Action.bStop = true;
 			return;
@@ -7181,21 +7269,79 @@ namespace BotBrain
 			// Seeing somebody is not the same as wanting a fight. Once per sighting the bot decides whether this one is worth it: a fighter with a
 			// gun usually is, somebody still looting or holding a pickaxe mostly walks the other way. Being shot, or somebody right on top of
 			// it, settles the matter.
+			// A decision to leave somebody alone does not survive the situation changing: they close in, point a gun at it, fire close by,
+			// or turn up again after being out of sight. Then it thinks again straight away. (A bot in the same room as a real player kept
+			// exploring because of a roll made earlier, 2026-11-09.)
+			if (Brain.IgnoreUntil > Obs.Now && Obs.bHasEnemy)
+			{
+				const char* Why = nullptr;
+
+				if (!Obs.bEnemyVisible)
+					Brain.bIgnoredLostSight = true;
+				else if (Brain.bIgnoredLostSight)
+					Why = "came back into view";
+
+				if (!Why && Obs.bEnemyVisible && Brain.IgnoredAtDist > 0.0f && Obs.EnemyDist < Brain.IgnoredAtDist * 0.5f)
+					Why = "closed in";
+
+				if (!Why && Obs.bEnemyVisible && Obs.bEnemyAimingAtMe)
+					Why = "aims at it";
+
+				if (!Why && Obs.bHeardSound && Obs.SoundTime > Brain.IgnoredAt && Dist2D(Obs.SoundPos, Obs.Pos) < 1500.0f)
+					Why = "fired close by";
+
+				if (Why)
+				{
+					static int Logged = 0;
+
+					if (++Logged <= 40)
+						LOG_INFO(LogBots, "BotAware #{} thinks again about the enemy it ignored ({}, {:.0f}u, human={})", Id, Why, Obs.EnemyDist, Obs.bEnemyIsHuman);
+
+					Brain.IgnoreUntil = 0.0f;
+					Brain.DecidedAt = -100.0f;
+				}
+			}
+
+			// a real player in plain view this close is never ignored: an armed bot fights, an unarmed one goes at them with the pickaxe or
+			// runs, by its own nerve (ShouldFlee)
+			const bool bCloseHuman = Obs.bHasEnemy && Obs.bEnemyIsHuman && Obs.bEnemyVisible && Obs.EnemyDist < 800.0f;
+
+			// the governor paces bot-against-bot fights only: towards a real player a bot keeps its own temperament
+			const float Governor = Obs.bEnemyIsHuman ? 1.0f : Obs.Governor;
+
 			if (Obs.bHasEnemy && Obs.bEnemyVisible && Obs.MovementMode == 1 && Obs.Now >= Brain.IgnoreUntil && Obs.Now - Brain.DecidedAt > 25.0f
-				&& Obs.Now - Brain.HurtAt > 10.0f && Obs.EnemyDist > 450.0f)
+				&& Obs.Now - Brain.HurtAt > 10.0f && Obs.EnemyDist > 450.0f && !bCloseHuman)
 			{
 				Brain.DecidedAt = Obs.Now;
-				float Appetite = Brain.Aggression * (Obs.bHasGun ? 1.0f : 0.2f) * (Obs.EnemyDist < 1500.0f ? 1.4f : 1.0f) * (Brain.bStrong ? (std::max)(Obs.Governor, 0.6f) : Obs.Governor);
+				float Appetite = Brain.Aggression * (Obs.bHasGun ? 1.0f : 0.2f) * (Obs.EnemyDist < 1500.0f ? 1.4f : 1.0f) * (Brain.bStrong ? (std::max)(Governor, 0.6f) : Governor);
 
 				// a real player is the interesting target: bots notice them and go for them far more readily than for each other
 				if (Obs.bEnemyIsHuman && Obs.bHasGun)
 					Appetite = (std::max)(Appetite * 2.5f, 0.7f);
 
 				if (RandRange(0.0f, 1.0f) > Appetite)
+				{
 					Brain.IgnoreUntil = Obs.Now + RandRange(20.0f, 45.0f);
+					Brain.IgnoredAtDist = Obs.EnemyDist;
+					Brain.IgnoredAt = Obs.Now;
+					Brain.bIgnoredLostSight = false;
+				}
 			}
 
-			const bool bProvoked = Obs.Now - Brain.HurtAt < 10.0f || (Obs.bHasEnemy && Obs.EnemyDist < 450.0f && (Obs.bHasGun || Obs.EnemyWeaponScore > 30.0f) && (Brain.Aggression > 0.25f || Obs.Governor > 0.5f));
+			const bool bProvoked = Obs.Now - Brain.HurtAt < 10.0f || bCloseHuman
+				|| (Obs.bHasEnemy && Obs.EnemyDist < 450.0f && (Obs.bHasGun || Obs.EnemyWeaponScore > 30.0f) && (Brain.Aggression > 0.25f || Governor > 0.5f));
+
+			if (bCloseHuman && !(Obs.bHasEnemy && Obs.Now - Brain.HurtAt < 10.0f))
+			{
+				static int Logged = 0;
+				static void* LastPawn = nullptr;
+
+				if (LastPawn != Brain.Controller && ++Logged <= 40)
+				{
+					LastPawn = Brain.Controller;
+					LOG_INFO(LogBots, "BotAware #{} reacts to a real player {:.0f}u away (armed={})", Id, Obs.EnemyDist, Obs.bHasGun);
+				}
+			}
 			const float Range = Obs.bHasGun ? EngageRange * 0.75f : 700.0f;
 
 			if (Obs.bHasEnemy && Obs.bEnemyVisible && Obs.EnemyDist < (bProvoked ? EngageRange : Range) && Obs.MovementMode == 1 && (bProvoked || Obs.Now >= Brain.IgnoreUntil))

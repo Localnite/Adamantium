@@ -58,9 +58,55 @@ inline int BotScanStack(uint64_t Rsp, uint64_t* Out, int Max)
 	return Count;
 }
 
+// Plain function (no C++ objects) so __try is allowed. True when Value looks like a live UObject: readable, and its class (+0x10) is readable
+// with a class of its own; the class goes to Class.
+inline bool BotProbeObject(uint64_t Value, uint64_t* Class)
+{
+	if (Value < 0x10000 || (Value & 7)) return false;
+
+	__try
+	{
+		const uint64_t VTable = *(uint64_t*)Value;
+		const uint64_t ObjectClass = *(uint64_t*)(Value + 0x10);
+		if (!VTable || !ObjectClass || (ObjectClass & 7)) return false;
+		const uint64_t ClassClass = *(uint64_t*)(ObjectClass + 0x10);
+		if (!ClassClass) return false;
+		HMODULE Module = nullptr;
+		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)VTable, &Module)) return false;
+		*Class = ObjectClass;
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// the registers at the crash, and for the ones that point at a UObject its name and class: which object a crash in game code was working on
+inline void BotLogRegisters(PCONTEXT Context)
+{
+	const std::pair<const char*, uint64_t> Registers[] = { {"rax", Context->Rax}, {"rbx", Context->Rbx}, {"rcx", Context->Rcx}, {"rdx", Context->Rdx}, {"rsi", Context->Rsi},
+		{"rdi", Context->Rdi}, {"r8", Context->R8}, {"r9", Context->R9}, {"r12", Context->R12}, {"r13", Context->R13}, {"r14", Context->R14}, {"r15", Context->R15} };
+
+	for (const auto& [Name, Value] : Registers)
+	{
+		uint64_t Class = 0;
+		if (BotProbeObject(Value, &Class))
+		{
+			LOG_ERROR(LogBots, "CRASHLOG   {} = 0x{:x} {} (class {})", Name, Value, ((UObject*)Value)->GetName(), ((UObject*)Class)->GetName());
+		}
+		else
+		{
+			LOG_ERROR(LogBots, "CRASHLOG   {} = 0x{:x}", Name, Value);
+		}
+	}
+}
+
+inline std::atomic<DWORD> gIgnoreFaultsThread = 0; // the hang watchdog while it copies another thread's stack (it reads past the end on purpose)
+
 inline LONG CALLBACK BotVectoredExceptionHandler(PEXCEPTION_POINTERS Info)
 {
 	const DWORD Code = Info->ExceptionRecord->ExceptionCode;
+
+	if (gIgnoreFaultsThread.load() == GetCurrentThreadId())
+		return EXCEPTION_CONTINUE_SEARCH;
 
 	// access violation, illegal instruction, int divide by zero, stack overflow
 	if (Code != 0xC0000005 && Code != 0xC000001D && Code != 0xC0000094 && Code != 0xC00000FD)
@@ -76,6 +122,9 @@ inline LONG CALLBACK BotVectoredExceptionHandler(PEXCEPTION_POINTERS Info)
 
 	LOG_ERROR(LogBots, "CRASHLOG exception 0x{:x} rip=0x{:x} ({}) info0={} info1=0x{:x} breadcrumb='{}' bot={}", Code, Rip, BotModuleOffset(Rip),
 		(uint64_t)Info->ExceptionRecord->ExceptionInformation[0], (uint64_t)Info->ExceptionRecord->ExceptionInformation[1], gBotBreadcrumb, gBotBreadcrumbId);
+
+	// only for crashes in the game's own code (a probe of ours that faults on purpose would flood the log otherwise)
+	if (BotModuleOffset(Rip).rfind("FortniteClient", 0) == 0) BotLogRegisters(Info->ContextRecord);
 
 	uint64_t Frames[48];
 	const int NumFrames = BotScanStack(Rsp, Frames, 48);
@@ -98,6 +147,192 @@ inline void InstallBotCrashLogger()
 	bInstalled = true;
 	AddVectoredExceptionHandler(1, BotVectoredExceptionHandler);
 	LOG_INFO(LogBots, "Bot crash logger installed");
+}
+
+// The executable on disk is encrypted; in memory it is plain. Writes the loaded image to exe_image.bin (next to reboot.log) so it can be read
+// in a disassembler (raw file offset == RVA).
+inline void DumpExeImage()
+{
+	const auto Base = (uintptr_t)GetModuleHandleW(nullptr);
+	const auto Dos = (IMAGE_DOS_HEADER*)Base;
+	const auto Nt = (IMAGE_NT_HEADERS64*)(Base + Dos->e_lfanew);
+	const size_t ImageSize = Nt->OptionalHeader.SizeOfImage;
+	FILE* Out = nullptr;
+	fopen_s(&Out, "exe_image.bin", "wb");
+	size_t Written = 0, Skipped = 0;
+
+	if (Out)
+	{
+		std::vector<uint8_t> Zero(0x10000, 0);
+
+		for (size_t At = 0; At < ImageSize;)
+		{
+			MEMORY_BASIC_INFORMATION Info{};
+			size_t Chunk = 0x10000;
+
+			if (VirtualQuery((void*)(Base + At), &Info, sizeof(Info)) && Info.State == MEM_COMMIT && !(Info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+			{
+				Chunk = (std::min)((size_t)(Info.BaseAddress) + Info.RegionSize - (Base + At), ImageSize - At);
+				fwrite((void*)(Base + At), 1, Chunk, Out);
+				Written += Chunk;
+			}
+			else
+			{
+				const size_t Gap = (std::min)(Chunk, ImageSize - At);
+				fwrite(Zero.data(), 1, Gap, Out);
+				Chunk = Gap;
+				Skipped += Gap;
+			}
+
+			At += Chunk;
+		}
+
+		fclose(Out);
+	}
+
+	LOG_INFO(LogBots, "NavDump: wrote the loaded image (base {:x}, size {:x}): {} bytes copied, {} bytes of unreadable gaps", Base, ImageSize, Written, Skipped);
+}
+
+// ---- hang diagnostics: a watchdog that writes where the game thread is stuck when it stops ticking ----
+// A hang leaves no dump and no CRASHLOG (the backend just kills the server for missing heartbeats), so when TickFlush has not run for
+// HangSeconds this thread suspends the game thread a few times and logs its rip and the module addresses on its stack.
+inline std::atomic<DWORD> gGameThreadId = 0;
+inline std::atomic<uint64_t> gLastTickMs = 0;
+
+// Plain function (no C++ objects) so __try is allowed. Copies the top of a (suspended) thread's stack.
+inline int HangCopyStack(uint64_t Rsp, uint64_t* Out, int Max)
+{
+	int Count = 0;
+
+	__try
+	{
+		for (; Count < Max; ++Count)
+			Out[Count] = ((uint64_t*)Rsp)[Count];
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+
+	return Count;
+}
+
+inline DWORD WINAPI HangWatchdogThread(LPVOID)
+{
+	constexpr uint64_t HangSeconds = 20; // a 98-bot fill blocks the game thread ~11 s on 1.10; the backend gives up after 45 s
+	constexpr int Samples = 4;
+	static uint64_t Stack[Samples][4096];
+	uint64_t ReportedFor = 0;
+
+	while (true)
+	{
+		Sleep(1000);
+
+		const uint64_t Last = gLastTickMs.load();
+		const DWORD ThreadId = gGameThreadId.load();
+
+		if (!Last || !ThreadId || GetTickCount64() - Last < HangSeconds * 1000 || ReportedFor == Last)
+			continue;
+
+		ReportedFor = Last; // once per stall
+
+		HANDLE Thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, ThreadId);
+
+		if (!Thread)
+		{
+			LOG_ERROR(LogBots, "HANGLOG game thread has not ticked for {} s, but OpenThread failed ({})", (GetTickCount64() - Last) / 1000, GetLastError());
+			continue;
+		}
+
+		CONTEXT Contexts[Samples]{};
+		int StackCounts[Samples]{};
+
+		// everything that allocates (the log line formatting) happens after ResumeThread: the game thread may be suspended holding the heap lock
+		for (int s = 0; s < Samples; ++s)
+		{
+			if (s) Sleep(300);
+
+			Contexts[s].ContextFlags = CONTEXT_FULL;
+
+			if (SuspendThread(Thread) == (DWORD)-1)
+				break;
+
+			if (GetThreadContext(Thread, &Contexts[s]))
+			{
+				gIgnoreFaultsThread = GetCurrentThreadId();
+				StackCounts[s] = HangCopyStack(Contexts[s].Rsp, Stack[s], 4096);
+				gIgnoreFaultsThread = 0;
+			}
+
+			ResumeThread(Thread);
+		}
+
+		CloseHandle(Thread);
+
+		LOG_ERROR(LogBots, "HANGLOG game thread (tid {}) has not ticked for {} s, breadcrumb='{}' bot={}", ThreadId, (GetTickCount64() - Last) / 1000, gBotBreadcrumb, gBotBreadcrumbId);
+
+		for (int s = 0; s < Samples; ++s)
+		{
+			if (!Contexts[s].Rip)
+				continue;
+
+			LOG_ERROR(LogBots, "HANGLOG sample {} rip=0x{:x} ({})", s, Contexts[s].Rip, BotModuleOffset(Contexts[s].Rip));
+		}
+
+		// the full stack only for the first sample; the others just show how far the rip moves (a tight loop or a wider one)
+		if (Contexts[0].Rip)
+		{
+			// raw values only: BotLogRegisters names the objects through the engine (GetName), and calling the engine from this thread
+			// crashed the server (1.10, 2026-11-08 23:19, while a long bot fill set the watchdog off)
+			const CONTEXT& C = Contexts[0];
+			LOG_ERROR(LogBots, "HANGLOG   rax={:x} rbx={:x} rcx={:x} rdx={:x} rsi={:x} rdi={:x} r8={:x} r9={:x} r12={:x} r13={:x} r14={:x} r15={:x}",
+				C.Rax, C.Rbx, C.Rcx, C.Rdx, C.Rsi, C.Rdi, C.R8, C.R9, C.R12, C.R13, C.R14, C.R15);
+
+			int Logged = 0;
+
+			for (int i = 0; i < StackCounts[0] && Logged < 160; ++i)
+			{
+				const uint64_t Value = Stack[0][i];
+				HMODULE Module = nullptr;
+
+				if (Value > 0x10000 && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)Value, &Module) && Module)
+					LOG_ERROR(LogBots, "HANGLOG   stack[{}] {}", Logged++, BotModuleOffset(Value));
+			}
+		}
+
+		spdlog::apply_all([](std::shared_ptr<spdlog::logger> Logger) { Logger->flush(); });
+
+		// the exe on disk is encrypted, so the addresses above can only be read against the loaded image
+		static bool bDumped = false;
+
+		if (!bDumped)
+		{
+			bDumped = true;
+			DumpExeImage();
+		}
+
+		// a second look 15 s later: if the breadcrumb moved, it is slow work rather than a stuck loop
+		Sleep(15000);
+
+		if (gLastTickMs.load() == Last)
+			LOG_ERROR(LogBots, "HANGLOG still not ticking after {} s, breadcrumb='{}' bot={}", (GetTickCount64() - Last) / 1000, gBotBreadcrumb, gBotBreadcrumbId);
+
+		spdlog::apply_all([](std::shared_ptr<spdlog::logger> Logger) { Logger->flush(); });
+	}
+
+	return 0;
+}
+
+// called from TickFlush on the game thread
+inline void HangWatchdogTick()
+{
+	if (!gGameThreadId.load())
+	{
+		gGameThreadId = GetCurrentThreadId();
+		gLastTickMs = GetTickCount64();
+		CreateThread(nullptr, 0, HangWatchdogThread, nullptr, 0, nullptr);
+		InstallBotCrashLogger();
+		LOG_INFO(LogBots, "Hang watchdog started (game thread {})", GetCurrentThreadId());
+	}
+
+	gLastTickMs = GetTickCount64();
 }
 
 class BotPOI
@@ -207,6 +442,7 @@ public:
 	float JumpAtTime = -1.0f; // when (in game seconds) to leave the bus; -1 = not scheduled yet
 	bool bJumpedFromBus = false;
 	FVector LastLoggedLocation;
+	float DiagLastHealth = -1.0f; // 1.x death-freeze diagnostics (Bots::DeathDiag*)
 
 	void OnPlayerEncountered()
 	{
@@ -234,6 +470,11 @@ public:
 		if (!ShouldUseAIBotController())
 		{
 			PawnClass = FindObject<UClass>(L"/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C");
+
+			// 1.10 runs this before the pawn blueprint is in memory, so the find gave null and no bot could ever spawn; load it then
+			if (!PawnClass)
+				PawnClass = LoadObject<UClass>(L"/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", BlueprintGeneratedClassClass);
+
 			ControllerClass = AFortPlayerControllerAthena::StaticClass();
 		}
 		else
@@ -253,6 +494,9 @@ public:
 
 	static bool IsReadyToSpawnBot()
 	{
+		if (!PawnClass)
+			InitializeBotClasses(); // the classes may not have been loaded when this ran at startup
+
 		return PawnClass;
 	}
 
@@ -376,7 +620,54 @@ public:
 		}
 
 		ApplyHID(Pawn, CurrentHeroType, true);
+		GiveGlider();
+	}
 
+	// A real player's pawn gets CustomizationLoadout.Glider from the locker; a bot's stayed null. 1.10's parachute code plays the glider's
+	// OpenSound (Pawn->CustomizationLoadout.Glider + 0x330) when it opens, and crashed the server at the first bot parachute.
+	// Each bot gets a glider of its own (any loaded one, so they do not all look the same), DefaultGlider if none is loaded.
+	void GiveGlider()
+	{
+		static int LoadoutOffset = Pawn->GetOffset("CustomizationLoadout", false);
+		static int GliderOffset = FindOffsetStruct("/Script/FortniteGame.FortAthenaLoadout", "Glider", false);
+
+		if (LoadoutOffset == -1 || GliderOffset == -1)
+			return;
+
+		auto& Glider = *(UObject**)(__int64(Pawn) + LoadoutOffset + GliderOffset);
+
+		if (Glider)
+			return;
+
+		static std::vector<UObject*> Gliders;
+		static bool bCollected = false;
+
+		if (!bCollected)
+		{
+			bCollected = true;
+
+			if (auto GliderClass = FindObject<UClass>(L"/Script/FortniteGame.AthenaGliderItemDefinition"))
+			{
+				auto All = GetAllObjectsOfClass(GliderClass);
+
+				for (int i = 0; i < All.size(); ++i)
+				{
+					if (All.at(i) && !All.at(i)->GetName().starts_with("Default__"))
+						Gliders.push_back(All.at(i));
+				}
+			}
+
+			if (Gliders.empty())
+			{
+				if (auto Default = LoadObject<UObject>(L"/Game/Athena/Items/Cosmetics/Gliders/DefaultGlider.DefaultGlider", nullptr))
+					Gliders.push_back(Default);
+			}
+
+			LOG_INFO(LogBots, "Bot gliders: {} to pick from", Gliders.size());
+		}
+
+		if (!Gliders.empty())
+			Glider = Gliders.at(std::rand() % Gliders.size());
 	}
 
 	void SetName(const FString& NewName)
@@ -723,6 +1014,10 @@ namespace Bots
 		playerBot.Id = gNextBotId++;
 		BOT_CRUMB("SpawnBot", playerBot.Id);
 		playerBot.Initialize(SpawnTransform, InSpawnLocator);
+
+		if (!playerBot.Controller || !playerBot.Pawn || !playerBot.PlayerState)
+			return nullptr; // Initialize logged why; a half-made bot must not reach the tick
+
 		AllPlayerBotsToTick.push_back(playerBot);
 		return playerBot.Controller;
 	}
@@ -1104,46 +1399,7 @@ namespace Bots
 			// The executable on disk is encrypted; in memory it is plain. Write the loaded image out once so it can be read in a disassembler
 			// (loaded at the same base as in this process, so the pointers in it still match).
 			if (CreateTries == 1)
-			{
-				const auto Base = (uintptr_t)GetModuleHandleW(nullptr);
-				const auto Dos = (IMAGE_DOS_HEADER*)Base;
-				const auto Nt = (IMAGE_NT_HEADERS64*)(Base + Dos->e_lfanew);
-				const size_t ImageSize = Nt->OptionalHeader.SizeOfImage;
-				FILE* Out = nullptr;
-				fopen_s(&Out, "exe_image.bin", "wb");
-				size_t Written = 0, Skipped = 0;
-
-				if (Out)
-				{
-					std::vector<uint8_t> Zero(0x10000, 0);
-
-					for (size_t At = 0; At < ImageSize;)
-					{
-						MEMORY_BASIC_INFORMATION Info{};
-						size_t Chunk = 0x10000;
-
-						if (VirtualQuery((void*)(Base + At), &Info, sizeof(Info)) && Info.State == MEM_COMMIT && !(Info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-						{
-							Chunk = (std::min)((size_t)(Info.BaseAddress) + Info.RegionSize - (Base + At), ImageSize - At);
-							fwrite((void*)(Base + At), 1, Chunk, Out);
-							Written += Chunk;
-						}
-						else
-						{
-							const size_t Gap = (std::min)(Chunk, ImageSize - At);
-							fwrite(Zero.data(), 1, Gap, Out);
-							Chunk = Gap;
-							Skipped += Gap;
-						}
-
-						At += Chunk;
-					}
-
-					fclose(Out);
-				}
-
-				LOG_INFO(LogBots, "NavDump: wrote the loaded image (base {:x}, size {:x}): {} bytes copied, {} bytes of unreadable gaps", Base, ImageSize, Written, Skipped);
-			}
+				DumpExeImage();
 
 			// the virtual table of the config object, as offsets from the executable's base, so the functions can be found in a disassembly
 			if (CreateTries == 1)
@@ -1946,6 +2202,14 @@ namespace Bots
 			}
 
 			auto NewBot = SpawnBot(PlayerStart->GetTransform(), PlayerStart);
+
+			if (!NewBot)
+			{
+				// Initialize logged why; trying the other bots would fail the same way (this used to crash on the null controller)
+				LOG_ERROR(LogBots, "Bot spawn failed; stopping after {} of {} bots", i, AmountOfBots);
+				return;
+			}
+
 			NewBot->SetCanBeDamaged(Fortnite_Version < 7); // idk lol for spawn island
 
 			static bool bSpawnedAITestPawn = false;
@@ -2043,7 +2307,7 @@ namespace Bots
 
 		std::string Bytes;
 
-		if (UniqueIdOffset != -1)
+		if (UniqueIdOffset != -1 && FUniqueNetIdRepl::HasReplicationBytes())
 		{
 			auto Id = State->GetPtr<FUniqueNetIdRepl>(UniqueIdOffset);
 			auto& Raw = Id->GetReplicationBytes();
@@ -2182,6 +2446,145 @@ namespace Bots
 		return Value >= 0 && Value < 255 ? (uint8)Value : 0;
 	}
 
+	// ---- 1.x death-freeze diagnostics ----
+	// A bot killed by a real player froze for 1-2 s before its death animation and the kill count (1.10, 2026-11-09). Logs, with game time,
+	// every health change of a bot and then what the pawn looks like for 2.5 s after our death handling, to see which comes first.
+	// After the death only raw memory is read (cached offsets): the engine may be freeing the pawn, and engine calls on it crashed before.
+	struct FDeathDiagOffsets
+	{
+		bool bReady = false;
+		int Dying = -1, PlayedDying = -1, Hidden = -1, Root = -1;
+		uint8 DyingMask = 0, PlayedDyingMask = 0, HiddenMask = 0;
+	};
+
+	static FDeathDiagOffsets& DeathDiagOffsets(AFortPlayerPawnAthena* LivePawn)
+	{
+		static FDeathDiagOffsets Offsets;
+
+		if (!Offsets.bReady && LivePawn)
+		{
+			Offsets.bReady = true;
+			auto Mask = [&](const char* Name, int& Offset, uint8& FieldMask)
+			{
+				Offset = LivePawn->GetOffset(Name, false);
+				auto Prop = LivePawn->GetProperty(Name, false);
+				FieldMask = Prop ? GetFieldMask(Prop) : 0;
+			};
+			Mask("bIsDying", Offsets.Dying, Offsets.DyingMask);
+			Mask("bPlayedDying", Offsets.PlayedDying, Offsets.PlayedDyingMask);
+			Mask("bIsHiddenForDeath", Offsets.Hidden, Offsets.HiddenMask);
+			Offsets.Root = LivePawn->GetOffset("RootComponent", false);
+		}
+
+		return Offsets;
+	}
+
+	static std::string DeathDiagFlags(void* Pawn)
+	{
+		const auto& O = DeathDiagOffsets(nullptr);
+
+		if (!O.bReady || !Pawn)
+			return "?";
+
+		auto Bit = [&](int Offset, uint8 FieldMask) { return Offset == -1 || !FieldMask ? -1 : ((*(uint8*)(__int64(Pawn) + Offset) & FieldMask) ? 1 : 0); };
+		const uint64_t Root = O.Root == -1 ? 0 : *(uint64_t*)(__int64(Pawn) + O.Root);
+		return std::format("dying={} playedDying={} hiddenForDeath={} root={:#x}", Bit(O.Dying, O.DyingMask), Bit(O.PlayedDying, O.PlayedDyingMask), Bit(O.Hidden, O.HiddenMask), Root);
+	}
+
+	struct FDeathWatch { void* Pawn; int Id; float Until; float NextLog; };
+	inline static std::vector<FDeathWatch> gDeathWatch;
+
+	static void DeathDiagHealth(PlayerBot& Bot, AFortPlayerPawnAthena* Pawn, float Health)
+	{
+		if (Fortnite_Version >= 2)
+			return;
+
+		DeathDiagOffsets(Pawn);
+
+		if (Bot.DiagLastHealth >= 0.0f && Health != Bot.DiagLastHealth)
+		{
+			const FVector At = Pawn->GetActorLocation();
+			LOG_INFO(LogBots, "DeathDiag #{} t={:.2f} health {:.0f} -> {:.0f} {} at ({:.0f}, {:.0f}, {:.0f})", Bot.Id, UGameplayStatics::GetTimeSeconds(GetWorld()),
+				Bot.DiagLastHealth, Health, DeathDiagFlags(Pawn), At.X, At.Y, At.Z);
+		}
+
+		Bot.DiagLastHealth = Health;
+	}
+
+	static void DeathDiagOnDeath(PlayerBot& Bot, void* Pawn)
+	{
+		if (Fortnite_Version >= 2 || !Pawn)
+			return;
+
+		const float Now = UGameplayStatics::GetTimeSeconds(GetWorld());
+		LOG_INFO(LogBots, "DeathDiag #{} t={:.2f} death handled {}", Bot.Id, Now, DeathDiagFlags(Pawn));
+		gDeathWatch.push_back({ Pawn, Bot.Id, Now + 2.5f, Now + 0.25f });
+	}
+
+	static void DeathDiagTick()
+	{
+		if (gDeathWatch.empty())
+			return;
+
+		const float Now = UGameplayStatics::GetTimeSeconds(GetWorld());
+
+		for (auto& Watch : gDeathWatch)
+		{
+			if (Now < Watch.NextLog || Now > Watch.Until)
+				continue;
+
+			Watch.NextLog = Now + 0.25f;
+			LOG_INFO(LogBots, "DeathDiag #{} t={:.2f} after death {}", Watch.Id, Now, DeathDiagFlags(Watch.Pawn));
+		}
+
+		std::erase_if(gDeathWatch, [Now](const FDeathWatch& Watch) { return Now > Watch.Until; });
+	}
+
+	// 1.x diagnostics for the skydive crash: the pawn's parachute code reads a native pointer at pawn+0x1698 that is null on an unpossessed bot.
+	// Log, once, what a real player's pawn holds there (and around it) next to a bot's, so bots can be given the same thing.
+	static void LogPawnParachuteFieldOnce()
+	{
+		static bool bDone = false;
+
+		if (bDone || Fortnite_Version >= 2)
+			return;
+
+		APawn* HumanPawn = nullptr;
+		APawn* BotPawn = nullptr;
+
+		for (auto& Info : BotBrain::gPawns)
+		{
+			if (!Info.Pawn)
+				continue;
+
+			if (Info.bIsBot) { if (!BotPawn) BotPawn = (APawn*)Info.Pawn; }
+			else if (!HumanPawn) HumanPawn = (APawn*)Info.Pawn;
+		}
+
+		if (!HumanPawn || !BotPawn)
+			return;
+
+		bDone = true;
+
+		for (auto [Label, Pawn] : { std::pair<const char*, APawn*>{ "player", HumanPawn }, std::pair<const char*, APawn*>{ "bot", BotPawn } })
+		{
+			for (int Offset = 0x1688; Offset <= 0x16a8; Offset += 8)
+			{
+				const uint64_t Value = *(uint64_t*)(__int64(Pawn) + Offset);
+				uint64_t Class = 0;
+
+				if (BotProbeObject(Value, &Class))
+				{
+					LOG_INFO(LogBots, "PawnField {} {} +0x{:x} = 0x{:x} {} (class {})", Label, Pawn->GetName(), Offset, Value, ((UObject*)Value)->GetFullName(), ((UObject*)Class)->GetName());
+				}
+				else
+				{
+					LOG_INFO(LogBots, "PawnField {} {} +0x{:x} = 0x{:x}", Label, Pawn->GetName(), Offset, Value);
+				}
+			}
+		}
+	}
+
 	// The client tells players apart by their unique id, and every bot has an empty one: the kill feed (and the elimination screen) then resolve to the
 	// same bot every time. Give each bot its own, copied from a real player's (the id is a shared pointer to a string object plus a reference controller).
 	static void AssignBotUniqueIds(AFortGameModeAthena* GameMode)
@@ -2315,11 +2718,14 @@ namespace Bots
 			*(uint8**)(Destination + 8) = Object;
 			*(uint8**)(Destination + 16) = Controller;
 
-			// the byte array was copied by pointer; the copy must not share it
-			auto& Raw = ((FUniqueNetIdRepl*)Destination)->GetReplicationBytes();
-			Raw.Data = nullptr;
-			Raw.ArrayNum = 0;
-			Raw.ArrayMax = 0;
+			// the byte array was copied by pointer; the copy must not share it (1.10 has no such array: writing it corrupted memory)
+			if (FUniqueNetIdRepl::HasReplicationBytes())
+			{
+				auto& Raw = ((FUniqueNetIdRepl*)Destination)->GetReplicationBytes();
+				Raw.Data = nullptr;
+				Raw.ArrayNum = 0;
+				Raw.ArrayMax = 0;
+			}
 
 			++Assigned;
 		}
@@ -2714,6 +3120,8 @@ namespace Bots
 		const float TickNow = UGameplayStatics::GetTimeSeconds(GetWorld());
 		BotBrain::RefreshShared(TickNow, GameMode);
 		AssignBotUniqueIds(GameMode);
+		LogPawnParachuteFieldOnce();
+		DeathDiagTick();
 		RunBotTest(GameState, GameMode, TickNow);
 		MaybeFillBots(GameState, TickNow);
 
@@ -2824,9 +3232,13 @@ namespace Bots
 				continue;
 			}
 
+			if (CurrentPawn)
+				DeathDiagHealth(PlayerBot, CurrentPawn, CurrentPawn->GetHealth());
+
 			if (CurrentPawn && CurrentPawn->GetHealth() <= 0.0f)
 			{
 				BOT_CRUMB("Tick:bot-death", PlayerBot.Id);
+				DeathDiagOnDeath(PlayerBot, CurrentPawn);
 				HandleBotDeath(PlayerBot, CurrentPawn, GameMode, GameState, CurrentPawn->GetActorLocation());
 				continue;
 			}

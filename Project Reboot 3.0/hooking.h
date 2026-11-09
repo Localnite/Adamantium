@@ -351,6 +351,12 @@ namespace Hooking
 
                 if (DefaultClass == FindObject(L"/Script/FortniteGame.Default__FortPlayerControllerAthena"))
                 {
+                    // Only into the classes that have the function: the slot index of a function declared on FortPlayerControllerAthena (e.g.
+                    // ServerGiveCreativeItem) means something else in a class that does not derive from it. In FortPlayerControllerOutpost it
+                    // was past its own virtuals, in the vtable of its team interface (+0x680, slot 0x28): the game mode's post-login called the
+                    // creative item hook for the player's team and the Storm Shield Defense server crashed (2026-11-07).
+                    auto DeclaringClass = (UStruct*)Function->GetOuter();
+
                     for (auto SubPath : {
                         L"/Script/FortniteGame.Default__FortPlayerController",
                         L"/Script/FortniteGame.Default__FortPlayerControllerGameplay",
@@ -358,7 +364,8 @@ namespace Hooking
                         L"/Script/FortniteGame.Default__FortPlayerControllerPvE",
                         L"/Script/FortniteGame.Default__FortPlayerControllerOutpost" })
                     {
-                        if (auto SubDefault = FindObject(SubPath))
+                        auto SubDefault = FindObject(SubPath);
+                        if (SubDefault && DeclaringClass && SubDefault->IsA(DeclaringClass))
                             VirtualSwap(SubDefault->VFTable, Idx, Detour);
                     }
                 }

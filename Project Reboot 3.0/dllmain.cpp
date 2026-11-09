@@ -1,3 +1,5 @@
+#include <unordered_map>
+#include <chrono>
 #include <Windows.h>
 #include <iostream>
 
@@ -11,6 +13,11 @@
 #include "FortPlayerControllerAthena.h"
 #include "AbilitySystemComponent.h"
 #include "ZoneHusks.h"
+#include "ZoneSearch.h"
+#include "ZoneMatchmaking.h"
+#include "ZoneFinder.h"
+#include "FortWorldItemDefinition.h"
+#include "FortQuickBars.h"
 #include "FortPlayerPawn.h"
 #include "globals.h"
 #include "FortInventoryInterface.h"
@@ -677,13 +684,15 @@ DWORD WINAPI ClientThread(LPVOID)
 
 static bool (*Zone_ReadyToStartMatchOriginal)(UObject*);
 static bool gZoneMatchStarted = false;
+static bool gZoneMatchStartPending = false; // the outpost's match start, waiting for the owner's quest config (see the player setup)
+static std::chrono::steady_clock::time_point gZoneMatchStartRequestedAt{};
 
 static bool Zone_Objective_StartPlayingObjective(UObject* Objective)
 {
     if (!Objective) return false;
 
     static int StatusOffset = Objective->GetOffset("ObjectiveStatus", false);
-    if (StatusOffset == -1) { StatusOffset = 0x3bf; LOG_WARN(LogDev, "Zone Objective: ObjectiveStatus reflection offset missing, using 0x3bf (7.30.1 value)"); }
+    if (StatusOffset == -1) { LOG_WARN(LogDev, "Zone Objective: FortObjectiveBase has no ObjectiveStatus"); return false; }
 
     uint8_t* StatusPtr = (uint8_t*)Objective + StatusOffset;
     LOG_INFO(LogDev, "Zone Objective StartPlayingObjective: {} (prev status {})", Objective->GetFullName(), (int)*StatusPtr);
@@ -695,14 +704,13 @@ static bool Zone_Objective_StartPlayingObjective(UObject* Objective)
         static auto OnRepFn = FindObject<UFunction>(L"/Script/FortniteGame.FortObjectiveBase.OnRep_ObjectiveStatus");
         if (OnRepFn) Objective->ProcessEvent(OnRepFn);
 
-        static int OwnerOffset = Objective->GetOffset("Owner", false);
-        if (OwnerOffset == -1) OwnerOffset = 0x108;
+        static int OwnerOffset = Objective->GetOffset("Owner");
         auto Mission = *(UObject**)((uint8_t*)Objective + OwnerOffset);
         if (Mission)
         {
             if (Mission->VFTable)
             {
-                auto OnObjStatusChanged = (void (*)(UObject*, UObject*, uint8_t))(Mission->VFTable[0x6b8 / 8]);
+                auto OnObjStatusChanged = (void (*)(UObject*, UObject*, uint8_t))(Mission->VFTable[ZoneFinder::Fixed730::MissionObjectiveStatusChangedSlot / 8]);
                 OnObjStatusChanged(Mission, Objective, 1);
             }
             else
@@ -720,83 +728,12 @@ static bool Zone_Objective_StartPlayingObjective(UObject* Objective)
         {
             if (Mission)
             {
-                static auto ManageInvFn = Mission->FindFunction("ManageInventory");
-                if (ManageInvFn)
-                {
-                    LOG_INFO(LogDev, "Zone: Invoking Mission->ManageInventory()");
-                    Mission->ProcessEvent(ManageInvFn, nullptr);
-                }
-                else
-                {
-                    LOG_ERROR(LogDev, "Zone: ManageInventory function not found on Mission!");
-                }
-
-                static auto StartEncounterFn = Mission->FindFunction("StartFirstEncounter");
-                if (StartEncounterFn)
-                {
-                    LOG_INFO(LogDev, "Zone: Invoking Mission->StartFirstEncounter()");
-                    Mission->ProcessEvent(StartEncounterFn, nullptr);
-                }
-                else
-                {
-                    LOG_ERROR(LogDev, "Zone: StartFirstEncounter function not found on Mission!");
-                }
+                Zone::PrepareMissionEncounters(Mission);
             }
 
-            // Verify the cutscene handgun and slot 1 activation
-            auto World = GetWorld();
-            static auto PlayerControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerController");
-            if (World && PlayerControllerClass)
-            {
-                auto PCs = UGameplayStatics::GetAllActorsOfClass(World, PlayerControllerClass);
-                for (int i = 0; i < PCs.Num(); i++)
-                {
-                    auto PC = Cast<AFortPlayerController>(PCs.at(i));
-                    if (!PC) continue;
-                    auto Inv = PC->GetWorldInventory();
-                    if (!Inv) continue;
-
-                    static auto HandgunDef = LoadObject<UFortItemDefinition>(L"/Game/Items/Weapons/Ranged/Pistol/SemiAuto/WID_Pistol_SemiAuto_C_Ore_T00.WID_Pistol_SemiAuto_C_Ore_T00");
-                    if (HandgunDef)
-                    {
-                        bool bFound = false;
-                        for (int j = 0; j < Inv->GetItemList().GetItemInstances().Num(); j++)
-                        {
-                            auto ItemInst = Inv->GetItemList().GetItemInstances().at(j);
-                            if (ItemInst && ItemInst->GetItemEntry() && ItemInst->GetItemEntry()->GetItemDefinition() == HandgunDef)
-                            {
-                                bFound = true;
-                                break;
-                            }
-                        }
-                        if (!bFound)
-                        {
-                            LOG_INFO(LogDev, "Zone: Handgun not found after ManageInventory, adding manually");
-                            bool bShouldUpdate = false;
-                            auto Added = Inv->AddItem(HandgunDef, &bShouldUpdate, 1);
-                            auto QuickBarsActor = PC->GetOffset("QuickBars", false) != -1 ? PC->Get<AActor*>(PC->GetOffset("QuickBars", false)) : nullptr;
-                            static auto ServerAddItemInternalFn = FindObject<UFunction>(L"/Script/FortniteGame.FortQuickBars.ServerAddItemInternal");
-                            if (QuickBarsActor && ServerAddItemInternalFn && Added.first.size() > 0)
-                            {
-                                struct { FGuid Item; uint8 Bar; int Slot; } SlotParams{ Added.first[0]->GetItemEntry()->GetItemGuid(), 0, 1 };
-                                QuickBarsActor->ProcessEvent(ServerAddItemInternalFn, &SlotParams);
-                            }
-                            if (bShouldUpdate) Inv->Update();
-                        }
-
-                        static auto ServerActivateSlotFn = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerActivateSlot");
-                        if (ServerActivateSlotFn)
-                        {
-                            struct { uint8 Bar; int Slot; float Duration; bool bForce; bool bFromServer; } ActParams{ 0, 1, 0.0f, true, false };
-                            PC->ProcessEvent(ServerActivateSlotFn, &ActParams);
-                        }
-                    }
-                }
-                PCs.Free();
-            }
-
-            Zone::SpawnTutorialHusks(Objective);
-            
+            // the StartFirstEncounter call above is the game's own husk spawn (its encounters + the AI director); this only starts
+            // watching for the pawns it produces (and falls back to hand-placed husks if it produces none)
+            Zone::OnHuskObjectiveStarted(Objective);
         }
     }
 
@@ -812,15 +749,15 @@ static bool Zone_Objective_ActivateObjective(UObject* Objective)
     static auto BpActivateFn = FindObject<UFunction>(L"/Script/FortniteGame.FortObjectiveBase.BlueprintOnActivated");
     if (BpActivateFn) Objective->ProcessEvent(BpActivateFn);
 
-    static int OwnerOffset = Objective->GetOffset("Owner", false);
-    if (OwnerOffset == -1) OwnerOffset = 0x108;
+    static int OwnerOffset = Objective->GetOffset("Owner");
     auto Mission = *(UObject**)((uint8_t*)Objective + OwnerOffset);
 
-    bool bStartOnMissionStart = (*((uint8_t*)Objective + 0x380) & 1) != 0;
+    static int StartOnMissionStartOffset = Objective->GetOffset("bStartPlayingOnMissionStart");
+    static uint8_t StartOnMissionStartMask = GetFieldMask(Objective->GetProperty("bStartPlayingOnMissionStart"));
+    bool bStartOnMissionStart = Objective->ReadBitfieldValue(StartOnMissionStartOffset, StartOnMissionStartMask);
     if (Mission && bStartOnMissionStart)
     {
-        static int MissionStatusOffset = Mission->GetOffset("MissionStatus", false);
-        if (MissionStatusOffset == -1) MissionStatusOffset = 0x488;
+        static int MissionStatusOffset = Mission->GetOffset("MissionStatus");
         if (*((uint8_t*)Mission + MissionStatusOffset) == 1)
         {
             Zone_Objective_StartPlayingObjective(Objective);
@@ -830,15 +767,142 @@ static bool Zone_Objective_ActivateObjective(UObject* Objective)
     return true;
 }
 
+// A component's world location through K2_GetComponentLocation (what the mission scripts read).
+static FVector Zone_ComponentWorldLocation(UObject* Component)
+{
+    static auto GetLocationFn = FindObject<UFunction>(L"/Script/Engine.SceneComponent.K2_GetComponentLocation");
+    if (!Component || !GetLocationFn) return FVector{};
+    std::vector<uint8_t> Params(GetLocationFn->GetPropertiesSize() + 16, 0);
+    Component->ProcessEvent(GetLocationFn, Params.data());
+    static int ReturnOffset = FindOffsetStruct("/Script/Engine.SceneComponent.K2_GetComponentLocation", "ReturnValue");
+    return ReturnOffset >= 0 ? *(FVector*)(Params.data() + ReturnOffset) : FVector{};
+}
+
+// Where a component of Owner should be in the world: Owner's transform with the component's relative location and yaw (the outpost props
+// are placed upright, so yaw is the only rotation that matters).
+static void Zone_ExpectedComponentWorld(AActor* Owner, UObject* Component, FVector& OutLocation, FRotator& OutRotation)
+{
+    static int RelativeLocationOffset = Component->GetOffset("RelativeLocation", false);
+    static int RelativeRotationOffset = Component->GetOffset("RelativeRotation", false);
+    const FVector Relative = RelativeLocationOffset >= 0 ? Component->Get<FVector>(RelativeLocationOffset) : FVector{};
+    const FRotator RelativeRotation = RelativeRotationOffset >= 0 ? Component->Get<FRotator>(RelativeRotationOffset) : FRotator{};
+    const FVector At = Owner->GetActorLocation();
+    const FRotator Rotation = Owner->GetActorRotation();
+    const double Yaw = Rotation.Yaw * 3.14159265358979 / 180.0;
+    OutLocation = FVector(At.X + (float)(Relative.X * cos(Yaw) - Relative.Y * sin(Yaw)), At.Y + (float)(Relative.X * sin(Yaw) + Relative.Y * cos(Yaw)), At.Z + Relative.Z);
+    OutRotation = Rotation;
+    OutRotation.Yaw += RelativeRotation.Yaw;
+}
+
+// Puts a component of Owner where it belongs in the world if its world location reads as something else. On this server the particle
+// components of BP_StormShield_Core_Egg read as the world origin although the core stands elsewhere (P_ArrowInteraction), and
+// the mission spawns the deployed core at another of them (TestSpawnLoc, SpawnCoreAndConsoles), so the core would land at the origin.
+static void Zone_FixComponentWorld(AActor* Owner, const char* ComponentName)
+{
+    if (!Owner) return;
+    const int ComponentOffset = Owner->GetOffset(ComponentName, false);
+    UObject* Component = ComponentOffset >= 0 ? Owner->Get<UObject*>(ComponentOffset) : nullptr;
+    if (!Component) { LOG_INFO(LogDev, "Zone: {} has no {} component", Owner->GetName(), ComponentName); return; }
+
+    FVector Expected; FRotator ExpectedRotation;
+    Zone_ExpectedComponentWorld(Owner, Component, Expected, ExpectedRotation);
+    const FVector Before = Zone_ComponentWorldLocation(Component);
+    const float Off = sqrtf((Before.X - Expected.X) * (Before.X - Expected.X) + (Before.Y - Expected.Y) * (Before.Y - Expected.Y) + (Before.Z - Expected.Z) * (Before.Z - Expected.Z));
+    if (Off < 5.0f)
+    {
+        LOG_INFO(LogDev, "Zone: {}.{} is in place at ({:.0f}, {:.0f}, {:.0f})", Owner->GetName(), ComponentName, Before.X, Before.Y, Before.Z);
+        return;
+    }
+
+    static auto SetWorldFn = FindObject<UFunction>(L"/Script/Engine.SceneComponent.K2_SetWorldLocationAndRotation");
+    if (!SetWorldFn) return;
+    static const char* SetWorldPath = "/Script/Engine.SceneComponent.K2_SetWorldLocationAndRotation";
+    static int NewLocationOffset = FindOffsetStruct(SetWorldPath, "NewLocation");
+    static int NewRotationOffset = FindOffsetStruct(SetWorldPath, "NewRotation");
+    static int SweepOffset = FindOffsetStruct(SetWorldPath, "bSweep");
+    static int TeleportOffset = FindOffsetStruct(SetWorldPath, "bTeleport");
+    std::vector<uint8_t> Params(SetWorldFn->GetPropertiesSize() + 64, 0);
+    *(FVector*)(Params.data() + NewLocationOffset) = Expected;
+    *(FRotator*)(Params.data() + NewRotationOffset) = ExpectedRotation;
+    Params[SweepOffset] = 0;
+    Params[TeleportOffset] = 1;
+    Component->ProcessEvent(SetWorldFn, Params.data());
+
+    const FVector After = Zone_ComponentWorldLocation(Component);
+    LOG_INFO(LogDev, "Zone: {}.{} read ({:.0f}, {:.0f}, {:.0f}) instead of ({:.0f}, {:.0f}, {:.0f}), set it there: now ({:.0f}, {:.0f}, {:.0f})", Owner->GetName(), ComponentName,
+        Before.X, Before.Y, Before.Z, Expected.X, Expected.Y, Expected.Z, After.X, After.Y, After.Z);
+}
+
+// The mission's answer to a finished objective. Mission_Outpost deploys the storm shield in HandleMissionEvent_ObjectiveSucceeded: when the
+// objective is its DeployCoreObjectiveHandle it starts SpawnCore four seconds later (SpawnCoreAndConsoles: the deployed core
+// BP_StormShield_Core_New and its four BP_Outpost_ControlPanel_New consoles, then the first supply drop, the egg destroyed, building allowed).
+// That event comes from the server's objective code, which this exe lacks: the deploy objectives succeeded on interacting with the core but
+// nothing else happened, no consoles, the egg still there (2026-11-08). The game's own dispatch (FortMissionLibrary.ExecuteMissionEventEx)
+// faulted when called from here before (ZoneSearch.cpp RaisePlayerBuilt), so the handler is called on the mission itself. Missions without
+// such a handler (the tutorial's Mission_FarmsteadFort) are left alone.
+static void Zone_RaiseObjectiveSucceeded(UObject* Mission, UObject* Objective)
+{
+    if (!Mission || !Objective) return;
+    auto HandlerFn = Mission->FindFunction("HandleMissionEvent_ObjectiveSucceeded");
+    if (!HandlerFn) return;
+
+    // the deployed core is spawned at the egg's TestSpawnLoc
+    static auto MissionOutpostClass = FindObject<UClass>(L"/Game/Missions/Primary/Outpost/Mission_Outpost.Mission_Outpost_C");
+    if (MissionOutpostClass && Mission->IsA(MissionOutpostClass))
+    {
+        static int EggOffset = Mission->GetOffset("BP_StormShield_Egg", false);
+        if (EggOffset >= 0) Zone_FixComponentWorld(Mission->Get<AActor*>(EggOffset), "TestSpawnLoc");
+    }
+
+    // parameter offsets straight from the function's properties (a blueprint function's path has a ':' that FindObject does not take)
+    auto ParamOffset = [HandlerFn](const std::string& Name) -> int
+    {
+        for (void* Property = *(void**)(__int64(HandlerFn) + Offsets::Children); Property; Property = GetNext(Property))
+            if (GetFNameOfProp(Property)->ToString() == Name) return *(int*)(__int64(Property) + Offsets::Offset_Internal);
+        return -1;
+    };
+    const int HandleOffset = ParamOffset("ObjectiveHandle");
+    const int GuidOffset = ParamOffset("InMissionGuid");
+    const int EventOffset = ParamOffset("MissionEvent");
+    const int TextOffset = ParamOffset("GenericText");
+    static int ObjectiveHandleOffset = Objective->GetOffset("ObjectiveHandle", false);
+    static int MissionGuidOffset = Mission->GetOffset("MissionGuid", false);
+    if (HandleOffset < 0 || TextOffset < 0 || ObjectiveHandleOffset < 0)
+    {
+        LOG_WARN(LogDev, "Zone: cannot raise ObjectiveSucceeded on {} (handler handle {}, text {}, objective handle {})", Mission->GetName(), HandleOffset, TextOffset, ObjectiveHandleOffset);
+        return;
+    }
+
+    // The handler copies every parameter onto its frame, the text too: it must be a real (empty) text, a zeroed one would be copied through a
+    // null pointer. Containers are copied bit for bit: the call only reads them and the frame copies are the engine's own.
+    static FText EmptyText = UKismetTextLibrary::Conv_StringToText(FString(L""));
+    std::vector<uint8_t> Params(HandlerFn->GetPropertiesSize() + 64, 0);
+    memcpy(Params.data() + HandleOffset, (uint8_t*)Objective + ObjectiveHandleOffset, 32); // FGameplayTagContainer: GameplayTags + ParentTags
+    memcpy(Params.data() + TextOffset, &EmptyText, sizeof(FText));
+    if (GuidOffset >= 0 && MissionGuidOffset >= 0) memcpy(Params.data() + GuidOffset, (uint8_t*)Mission + MissionGuidOffset, 16);
+    if (EventOffset >= 0)
+    {
+        static int EventNameOffset = FindOffsetStruct("/Script/FortniteGame.FortEventName", "EventName", false);
+        if (EventNameOffset >= 0) *(FName*)(Params.data() + EventOffset + EventNameOffset) = UKismetStringLibrary::Conv_StringToName(L"ObjectiveSucceeded");
+    }
+
+    LOG_INFO(LogDev, "Zone: raising ObjectiveSucceeded for {} on {}", Objective->GetName(), Mission->GetName());
+    Mission->ProcessEvent(HandlerFn, Params.data());
+}
+
 static void Zone_Objective_StopObjective(UObject* Objective, uint8_t Status, void* Description, UObject* Badge)
 {
     if (!Objective) return;
 
     static int StatusOffset = Objective->GetOffset("ObjectiveStatus", false);
-    if (StatusOffset == -1) { StatusOffset = 0x3bf; LOG_WARN(LogDev, "Zone Objective: ObjectiveStatus reflection offset missing, using 0x3bf (7.30.1 value)"); }
+    if (StatusOffset == -1) { LOG_WARN(LogDev, "Zone Objective: FortObjectiveBase has no ObjectiveStatus"); return; }
 
     uint8_t* StatusPtr = (uint8_t*)Objective + StatusOffset;
     LOG_INFO(LogDev, "Zone Objective StopObjective: {} -> status {}", Objective->GetFullName(), (int)Status);
+
+    // the tutorial's last objective: the mission succeeds, and the zone end that should follow is server code this exe lacks
+    if (Status == 2 && Objective->GetName().contains("OBJ_DefendFort"))
+        Zone::BeginEndOfZone();
 
     if (*StatusPtr != Status)
     {
@@ -850,20 +914,22 @@ static void Zone_Objective_StopObjective(UObject* Objective, uint8_t Status, voi
         static auto BpEndFn = FindObject<UFunction>(L"/Script/FortniteGame.FortObjectiveBase.BlueprintOnObjectiveEnd");
         if (BpEndFn) Objective->ProcessEvent(BpEndFn, &Status);
 
-        static int OwnerOffset = Objective->GetOffset("Owner", false);
-        if (OwnerOffset == -1) OwnerOffset = 0x108;
+        static int OwnerOffset = Objective->GetOffset("Owner");
         if (auto Mission = *(UObject**)((uint8_t*)Objective + OwnerOffset))
         {
-            // 0x6b8 is the mission's OnObjectiveStatusChanged slot on 7.30.1; a null vtable must not be called through
+            // the mission's OnObjectiveStatusChanged (a slot with no code to read it from, see ZoneFinder.h); a null vtable must not be called through
             if (Mission->VFTable)
             {
-                auto OnObjStatusChanged = (void (*)(UObject*, UObject*, uint8_t))(Mission->VFTable[0x6b8 / 8]);
+                auto OnObjStatusChanged = (void (*)(UObject*, UObject*, uint8_t))(Mission->VFTable[ZoneFinder::Fixed730::MissionObjectiveStatusChangedSlot / 8]);
                 OnObjStatusChanged(Mission, Objective, Status);
             }
             else
             {
                 LOG_WARN(LogDev, "Zone Objective: mission has no vtable, status change not forwarded");
             }
+
+            if (Status == 2) // EFortObjectiveStatus::Succeeded
+                Zone_RaiseObjectiveSucceeded(Mission, Objective);
         }
 
         ((AActor*)Objective)->ForceNetUpdate();
@@ -883,6 +949,28 @@ static UObject* Zone_GetAIDirectorStub(UObject*)
     return AIDirectorOffset == -1 ? nullptr : GameMode->Get<UObject*>(AIDirectorOffset);
 }
 
+// The same folded stub is also the goal manager's getter, so some of the callers found below want the AIGoalManager instead (their callee reads a small object:
+// b78fd0 looks up a pawn in a map at this+0x360, the director's own fields start far above that). Handing them the director made a husk pawn fault in that
+// map lookup (exe+0xb6b92f) a few seconds after it spawned. Call sites told apart by what they call next (fnmod/re/d730.py, callee offsets).
+static UObject* Zone_GetAIGoalManagerStub(UObject*)
+{
+    auto World = (UObject*)GetWorld();
+    auto GameMode = World ? World->Get<UObject*>("AuthorityGameMode") : nullptr;
+    if (!GameMode) return nullptr;
+
+    static auto GoalManagerOffset = GameMode->GetOffset("AIGoalManager", false);
+    auto GoalManager = GoalManagerOffset == -1 ? nullptr : GameMode->Get<UObject*>(GoalManagerOffset);
+
+    static bool bLogged = false;
+    if (!bLogged)
+    {
+        bLogged = true;
+        LOG_INFO(LogDev, "Zone: first goal manager lookup returned {} (AIGoalManager offset {})", GoalManager ? GoalManager->GetFullName() : "NULL", GoalManagerOffset);
+    }
+
+    return GoalManager;
+}
+
 static void Zone_PatchAIDirectorCallers()
 {
     if (Fortnite_Version < 7.3 || Fortnite_Version >= 8.0) return;
@@ -894,7 +982,13 @@ static void Zone_PatchAIDirectorCallers()
     auto Base = (uint8_t*)GetModuleHandleW(0);
     auto Nt = (PIMAGE_NT_HEADERS)(Base + ((PIMAGE_DOS_HEADER)Base)->e_lfanew);
     const uint64_t ImageSize = Nt->OptionalHeader.SizeOfImage;
-    const uint64_t Target = (uint64_t)Base + 0x2b1cf0;
+    // the folded "return nullptr" getter, found through a goal manager call site (ZoneFinder.h)
+    const uint64_t Target = ZoneFinder::AIManagerLookupStub();
+    if (!Target)
+    {
+        LOG_WARN(LogDev, "Zone: the AI manager lookup stub was not found, AI director redirect is OFF");
+        return;
+    }
 
     // a stub within +-2GB of the exe so a rel32 call can reach it: mov rax, imm64; jmp rax
     uint8_t* Stub = nullptr;
@@ -911,6 +1005,24 @@ static void Zone_PatchAIDirectorCallers()
     *(uint64_t*)(Stub + 2) = (uint64_t)&Zone_GetAIDirectorStub;
     Stub[10] = 0xFF; Stub[11] = 0xE0;
 
+    uint8_t* GoalStub = Stub + 16;
+    GoalStub[0] = 0x48; GoalStub[1] = 0xB8;
+    *(uint64_t*)(GoalStub + 2) = (uint64_t)&Zone_GetAIGoalManagerStub;
+    GoalStub[10] = 0xFF; GoalStub[11] = 0xE0;
+
+    // call sites (found by signature, ZoneFinder.h) whose callee works on the goal manager (the assignment registration, MakeGoalSelectionQuery, ...)
+    const uint64_t* GoalManagerSites = nullptr;
+    const int GoalManagerCount = ZoneFinder::GoalManagerSites(GoalManagerSites);
+
+    // More callers pass a world-context object straight through (`mov rcx, rbx; call`) instead of the GetWorld() result, so the pattern below misses them. One of
+    // them fed the encounter's target list: left null, an encounter that has target actors (the defend-the-fort ones) faulted and was left with no spawn
+    // points. Same sorting: the callee reads the goal manager's fields (+0x338/+0x348/+0x360) or the director's (past 0xc80).
+    const uint64_t* ContextGoalManagerSites = nullptr;
+    const int ContextGoalManagerCount = ZoneFinder::ContextGoalManagerSites(ContextGoalManagerSites);
+    const uint64_t* ContextDirectorSites = nullptr;
+    const int ContextDirectorCount = ZoneFinder::ContextDirectorSites(ContextDirectorSites);
+    int PatchedGoal = 0;
+
     int Patched = 0;
     auto Section = IMAGE_FIRST_SECTION(Nt);
     for (int s = 0; s < Nt->FileHeader.NumberOfSections; ++s, ++Section)
@@ -923,41 +1035,57 @@ static void Zone_PatchAIDirectorCallers()
         for (uint64_t i = 9; i + 5 <= Size; ++i)
         {
             if (Start[i] != 0xE8) continue;
-            // call [rax+0x140]; mov rcx, rax; call
-            static const uint8_t Pre[9] = { 0xFF, 0x90, 0x40, 0x01, 0x00, 0x00, 0x48, 0x8B, 0xC8 };
-            if (memcmp(Start + i - 9, Pre, 9) != 0) continue;
 
             const uint64_t Dest = (uint64_t)(Start + i + 5) + *(int32_t*)(Start + i + 1);
             if (Dest != Target) continue;
 
+            const uint64_t Site = (uint64_t)(Start + i);
+
+            // call [rax+0x140]; mov rcx, rax; call
+            static const uint8_t Pre[9] = { 0xFF, 0x90, 0x40, 0x01, 0x00, 0x00, 0x48, 0x8B, 0xC8 };
+            const bool bGetWorldForm = memcmp(Start + i - 9, Pre, 9) == 0;
+
+            bool bGoalManager = false, bListedContextSite = false;
+            for (int k = 0; k < GoalManagerCount; ++k) bGoalManager |= bGetWorldForm && GoalManagerSites[k] == Site;
+            for (int k = 0; k < ContextGoalManagerCount; ++k) { if (ContextGoalManagerSites[k] == Site) bGoalManager = bListedContextSite = true; }
+            for (int k = 0; k < ContextDirectorCount; ++k) bListedContextSite |= ContextDirectorSites[k] == Site;
+
+            // the folded stub has thousands of unrelated callers: only the GetWorld() form and the listed context-object sites are managers
+            if (!bGetWorldForm && !bListedContextSite) continue;
+
             DWORD Old = 0;
             if (VirtualProtect(Start + i + 1, 4, PAGE_EXECUTE_READWRITE, &Old))
             {
-                *(int32_t*)(Start + i + 1) = (int32_t)((int64_t)Stub - (int64_t)(Start + i + 5));
+                *(int32_t*)(Start + i + 1) = (int32_t)((int64_t)(bGoalManager ? GoalStub : Stub) - (int64_t)(Start + i + 5));
                 VirtualProtect(Start + i + 1, 4, Old, &Old);
                 ++Patched;
+                PatchedGoal += bGoalManager ? 1 : 0;
             }
         }
     }
 
-    // zero matches means the byte pattern or the 0x2b1cf0 target is not on this build: AI director lookups then stay on the stub-less path
+    // zero matches means the byte pattern is not on this build: AI director lookups then stay on the stub-less path
     if (Patched == 0)
     {
         LOG_WARN(LogDev, "Zone: no AI director call sites matched the 7.30.1 pattern, AI director redirect is OFF");
         return;
     }
 
-    LOG_INFO(LogDev, "Zone: redirected {} AI director lookups to GameMode->AIDirector", Patched);
+    LOG_INFO(LogDev, "Zone: redirected {} AI manager lookups ({} to GameMode->AIGoalManager, the rest to GameMode->AIDirector)", Patched, PatchedGoal);
 }
 
 // The Fort replication graph has no route for FortQuickBars (class policy 0, not routed; FortInventory is too but the graph collects the controller's WorldInventory by
-// interface), so a quickbars actor would never reach the client and ClientRestart waits for it forever. Policy 1 = relevant to all connections. 7.30.1 (CL 4834550) addresses
-// found with fnmod/re/d730.py: ClassRepNodePolicies is at graph+0x4e0 and its lookup is exe+0x133c8d0.
+// interface), so a quickbars actor would never reach the client and ClientRestart waits for it forever. Policy 1 = relevant to all connections. The graph's
+// ClassRepNodePolicies map and its lookup are found by signature (ZoneFinder.h: the lookup's caller passes the map with lea rcx, [graph+offset]).
 static void Zone_RouteQuickBars()
 {
-    // the GetPolicy RVA (0x133c8d0) and the graph member offset (0x4e0) were read from the 7.30.1 build only; any other
-    // build would call an unrelated function, so this is held to 7.30 until those are re-checked for each new build
-    if (Fortnite_Version < 7.3 || Fortnite_Version >= 7.31) return;
+    auto GetPolicy = (int* (*)(void*, UObject*))ZoneFinder::ClassRepNodePolicyLookup();
+    const int PoliciesOffset = ZoneFinder::ClassRepNodePoliciesOffset();
+    if (!GetPolicy || PoliciesOffset < 0)
+    {
+        LOG_WARN(LogDev, "Zone: the replication graph's class policy lookup was not found, quickbars cannot be routed.");
+        return;
+    }
 
     auto World = (UObject*)GetWorld();
     auto Driver = World ? World->Get<UObject*>("NetDriver") : nullptr;
@@ -969,14 +1097,12 @@ static void Zone_RouteQuickBars()
         return;
     }
 
-    auto GetPolicy = (int* (*)(void*, UObject*))(__int64(GetModuleHandleW(0)) + 0x133c8d0);
-
     for (auto Path : { L"/Script/FortniteGame.FortQuickBars", L"/Script/FortniteGame.FortQuickBarsAthena" })
     {
         auto Class = FindObject<UClass>(Path);
         if (!Class) continue;
 
-        auto Policy = GetPolicy((char*)Graph + 0x4e0, Class);
+        auto Policy = GetPolicy((char*)Graph + PoliciesOffset, Class);
         if (!Policy) continue;
 
         LOG_INFO(LogDev, "Zone: replication policy of {} was {}, now relevant to all connections", Class->GetName(), *Policy);
@@ -1007,6 +1133,113 @@ static void Zone_AllowBuilding()
     struct { bool bBuildingWithoutLayoutRequirementsAllowed; bool bBuildingAtLayoutRequirementsAllowed; } Params{ true, true };
     GameState->ProcessEvent(SetBuildingAllowedFn, &Params);
     LOG_INFO(LogDev, "Zone: called FortGameStateZone.SetBuildingAllowed on {} (both requirements allowed)", GameState->GetFullName());
+}
+
+// The engine creates the AI system (behavior tree, perception and environment query managers) when a world is initialized, and the log shows it did so for the
+// Frontend world only ("Creating AISystem for world Frontend"). Without it the AI director's rift manager has no environment query manager to find spawn rifts with:
+// its encounters stay in EFortEncounterState::InitializingRiftManager for good, which is why the fort's waves never spawned. Make it when the world has none.
+static void Zone_EnsureAISystem()
+{
+    auto World = (UObject*)GetWorld();
+    if (!World) return;
+
+    static int AISystemOffset = World->GetOffset("AISystem", false);
+    if (AISystemOffset == -1)
+    {
+        LOG_WARN(LogDev, "Zone: UWorld has no AISystem property here");
+        return;
+    }
+
+    auto Existing = World->Get<UObject*>(AISystemOffset);
+    if (Existing)
+    {
+        auto Queries = Existing->Get<UObject*>("EnvironmentQueryManager");
+        LOG_INFO(LogDev, "Zone: world already has AI system {} (environment query manager {})", Existing->GetFullName(), Queries ? "present" : "MISSING");
+        return;
+    }
+
+    static auto SystemClass = FindObject<UClass>(L"/Script/FortniteGame.FortAISystem");
+    if (!SystemClass)
+    {
+        LOG_WARN(LogDev, "Zone: FortAISystem class not found, no AI system created");
+        return;
+    }
+
+    auto System = UGameplayStatics::SpawnObject(SystemClass, World);
+    if (!System)
+    {
+        LOG_WARN(LogDev, "Zone: could not create the AI system");
+        return;
+    }
+
+    World->Get<UObject*>(AISystemOffset) = System;
+    auto Queries = System->Get<UObject*>("EnvironmentQueryManager");
+    auto Trees = System->Get<UObject*>("BehaviorTreeManager");
+    LOG_INFO(LogDev, "Zone: created AI system {} (environment query manager {}, behavior tree manager {})", System->GetFullName(), Queries ? "present" : "MISSING", Trees ? "present" : "MISSING");
+}
+
+// The storm shield core on the outpost. Its mission (MissionInfo_Outpost_PvE_01, MissionPlacementInfo) has the world manager place
+// BP_StormShield_Core_Egg at the FortPlacementActor tagged Outpost.PlacementActor.Egg (OutpostPlacementQuery_CoreEgg), but that runs for the
+// missions of the world record only, and this mission is loaded without a record ("MissionRecrod not found! Cannot initializea actors."):
+// the player was told to activate a storm shield that was not there (2026-11-07). Mission_Outpost's InitBuildingData looks for an egg actor in
+// the world when initialization gave none ("Found a StormShield Egg actor even though it was not returned by mission initialization ... we
+// should be able to continue"), so spawning it at that placement actor before the mission starts is enough.
+static void Zone_SpawnOutpostCoreEgg()
+{
+    static auto EggClass = LoadObject<UClass>(L"/Game/Missions/Primary/Outpost/Props/BP_StormShield_Core_Egg.BP_StormShield_Core_Egg_C", FindObject<UClass>(L"/Script/Engine.BlueprintGeneratedClass"));
+    static auto PlacementClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlacementActor");
+    if (!EggClass || !PlacementClass) { LOG_WARN(LogDev, "Zone: storm shield core: class missing (egg {}, placement actor {})", (bool)EggClass, (bool)PlacementClass); return; }
+
+    auto Eggs = UGameplayStatics::GetAllActorsOfClass(GetWorld(), EggClass);
+    const int ExistingEggs = Eggs.Num();
+    Eggs.Free();
+    if (ExistingEggs > 0) { LOG_INFO(LogDev, "Zone: storm shield core already there"); return; }
+
+    const auto EggTag = UKismetStringLibrary::Conv_StringToName(L"Outpost.PlacementActor.Egg");
+    AActor* Placement = nullptr;
+    auto Placements = UGameplayStatics::GetAllActorsOfClass(GetWorld(), PlacementClass);
+    for (int i = 0; i < Placements.Num() && !Placement; ++i)
+    {
+        auto Candidate = Placements.at(i);
+        static auto TagsOffset = Candidate->GetOffset("StaticGameplayTags", false);
+        if (TagsOffset == -1) break;
+        auto& Tags = Candidate->Get<TArray<FName>>(TagsOffset); // FGameplayTagContainer: GameplayTags (FGameplayTag = one FName) first
+        for (int t = 0; t < Tags.Num(); ++t)
+            if (Tags.at(t).ComparisonIndex.Value == EggTag.ComparisonIndex.Value) { Placement = Candidate; break; }
+    }
+    const int PlacementCount = Placements.Num();
+    Placements.Free();
+
+    if (!Placement) { LOG_WARN(LogDev, "Zone: storm shield core: none of the {} placement actors is tagged Outpost.PlacementActor.Egg", PlacementCount); return; }
+
+    FTransform Transform = Placement->GetTransform();
+    Transform.Scale3D = FVector(1, 1, 1);
+    auto Egg = GetWorld()->SpawnActor<AActor>(EggClass, Transform);
+    const FVector At = Transform.Translation;
+    LOG_INFO(LogDev, "Zone: storm shield core {} spawned at {} ({:.0f}, {:.0f}, {:.0f})", Egg ? Egg->GetName() : "NOT", Placement->GetName(), At.X, At.Y, At.Z);
+}
+
+// Starts playing every mission the Zone's mission manager has (UFortMissionManager::StartPlayingMission); nothing on this build starts them by itself.
+static void Zone_StartLoadedMissions()
+{
+    auto ZoneGameState = ((UObject*)GetWorld())->Get<UObject*>("GameState");
+    auto MissionMgr = ZoneGameState ? ZoneGameState->Get<UObject*>("MissionManager") : nullptr;
+    if (!MissionMgr) return;
+
+    static int MissionsOffset = MissionMgr->GetOffset("Missions", false);
+    if (MissionsOffset == -1) return;
+
+    auto& Missions = MissionMgr->Get<TArray<UObject*>>(MissionsOffset);
+    auto StartPlayingMission = (void (*)(UObject*, UObject*))(MissionMgr->VFTable[ZoneFinder::Fixed730::MissionManagerStartPlayingSlot / 8]);
+    for (int i = 0; i < Missions.Num(); ++i)
+    {
+        if (auto Mission = Missions.at(i))
+        {
+            StartPlayingMission(MissionMgr, Mission);
+            static int MissionStatusOffset = Mission->GetOffset("MissionStatus");
+            LOG_INFO(LogDev, "Zone: started mission {} (status {})", Mission->GetFullName(), (int)*((uint8_t*)Mission + MissionStatusOffset));
+        }
+    }
 }
 
 // Listens once for the Zone world: with the replication graph switched on first (the Zone game mode ships with it off and only the graph delivers actors on this client exe),
@@ -1044,15 +1277,15 @@ static bool Zone_ListenOnce()
     }
 
     Zone_PatchAIDirectorCallers();
+    Zone_EnsureAISystem();
+    Zone::InstallAIControllerPossess();
 
-    // 7.30.1 AI crash patches for spawning AI pawns on client binary acting as dedicated server:
+    // AI crash patches for spawning AI pawns on client binary acting as dedicated server (each place found by signature, ZoneFinder.h):
     if (Fortnite_Version >= 7.3 && Fortnite_Version < 8.0)
     {
-        uint8_t* Base = (uint8_t*)GetModuleHandleW(0);
-
-        // 1. Patch GetPawnGoalSelectionCriteria null criteria crash (+0xbd964d: cmp rbx, rdi -> test rbx, rbx)
-        uint8_t* Target1 = Base + 0xbd964d;
-        if (Target1[0] == 0x48 && Target1[1] == 0x3B && Target1[2] == 0xDF)
+        // 1. Patch GetPawnGoalSelectionCriteria null criteria crash (cmp rbx, rdi -> test rbx, rbx)
+        uint8_t* Target1 = (uint8_t*)ZoneFinder::GoalCriteriaCompareSite();
+        if (Target1 && Target1[0] == 0x48 && Target1[1] == 0x3B && Target1[2] == 0xDF)
         {
             DWORD OldProtect = 0;
             if (VirtualProtect(Target1, 3, PAGE_EXECUTE_READWRITE, &OldProtect))
@@ -1060,46 +1293,46 @@ static bool Zone_ListenOnce()
                 Target1[1] = 0x85; // test
                 Target1[2] = 0xDB; // rbx, rbx
                 VirtualProtect(Target1, 3, OldProtect, &OldProtect);
-                LOG_INFO(LogDev, "Zone: patched GetPawnGoalSelectionCriteria at +0xbd964d");
+                LOG_INFO(LogDev, "Zone: patched GetPawnGoalSelectionCriteria");
             }
         }
 
-        // 2. Patch AFortAIPawn::BeginPlay AIDirector assignment call (+0xb27ce8: je -> jmp)
-        uint8_t* Target2 = Base + 0xb27ce8;
-        if (Target2[0] == 0x74 && Target2[1] == 0x0B)
+        // 2. Patch AFortAIPawn::BeginPlay AIDirector assignment call (je -> jmp)
+        uint8_t* Target2 = (uint8_t*)ZoneFinder::AIPawnBeginPlayAssignSite();
+        if (Target2 && Target2[0] == 0x74 && Target2[1] == 0x0B)
         {
             DWORD OldProtect = 0;
             if (VirtualProtect(Target2, 1, PAGE_EXECUTE_READWRITE, &OldProtect))
             {
-                Target2[0] = 0xEB; // jmp +0x0b (skip 0xb7f0c0 assignment registration)
+                Target2[0] = 0xEB; // jmp +0x0b (skip the assignment registration)
                 VirtualProtect(Target2, 1, OldProtect, &OldProtect);
-                LOG_INFO(LogDev, "Zone: patched AFortAIPawn::BeginPlay at +0xb27ce8");
+                LOG_INFO(LogDev, "Zone: patched AFortAIPawn::BeginPlay");
             }
         }
 
-        // 3. Stub 0xb7f0c0 (assignment registration) to immediately ret
-        uint8_t* Target3 = Base + 0xb7f0c0;
-        if (Target3[0] == 0x40 && Target3[1] == 0x55)
+        // 3. Stub the assignment registration to immediately ret
+        uint8_t* Target3 = (uint8_t*)ZoneFinder::AssignmentRegistration();
+        if (Target3 && Target3[0] == 0x40 && Target3[1] == 0x55)
         {
             DWORD OldProtect = 0;
             if (VirtualProtect(Target3, 1, PAGE_EXECUTE_READWRITE, &OldProtect))
             {
                 Target3[0] = 0xC3; // ret
                 VirtualProtect(Target3, 1, OldProtect, &OldProtect);
-                LOG_INFO(LogDev, "Zone: stubbed assignment registration at +0xb7f0c0");
+                LOG_INFO(LogDev, "Zone: stubbed the assignment registration");
             }
         }
 
-        // 4. Stub MakeGoalSelectionQuery (+0xb84a10: xor eax, eax; ret)
-        uint8_t* Target4 = Base + 0xb84a10;
-        if (Target4[0] == 0x48 && Target4[1] == 0x89)
+        // 4. Stub MakeGoalSelectionQuery (xor eax, eax; ret)
+        uint8_t* Target4 = (uint8_t*)ZoneFinder::MakeGoalSelectionQuery();
+        if (Target4 && Target4[0] == 0x48 && Target4[1] == 0x89)
         {
             DWORD OldProtect = 0;
             if (VirtualProtect(Target4, 3, PAGE_EXECUTE_READWRITE, &OldProtect))
             {
                 Target4[0] = 0x31; Target4[1] = 0xC0; Target4[2] = 0xC3; // xor eax, eax; ret
                 VirtualProtect(Target4, 3, OldProtect, &OldProtect);
-                LOG_INFO(LogDev, "Zone: stubbed MakeGoalSelectionQuery at +0xb84a10");
+                LOG_INFO(LogDev, "Zone: stubbed MakeGoalSelectionQuery");
             }
         }
     }
@@ -1107,9 +1340,9 @@ static bool Zone_ListenOnce()
     // 2. Restore stripped WITH_SERVER_CODE virtual methods on AFortObjectiveBase (ActivateObjective, StartPlayingObjective, StopObjective).
     if (auto DefaultObjBase = FindObject<UObject>(L"/Script/FortniteGame.Default__FortObjectiveBase"))
     {
-        VirtualSwap(DefaultObjBase->VFTable, 0x610 / 8, Zone_Objective_ActivateObjective);
-        VirtualSwap(DefaultObjBase->VFTable, 0x618 / 8, Zone_Objective_StartPlayingObjective);
-        VirtualSwap(DefaultObjBase->VFTable, 0x660 / 8, Zone_Objective_StopObjective);
+        VirtualSwap(DefaultObjBase->VFTable, ZoneFinder::Fixed730::ObjectiveActivateSlot / 8, Zone_Objective_ActivateObjective);
+        VirtualSwap(DefaultObjBase->VFTable, ZoneFinder::Fixed730::ObjectiveStartPlayingSlot / 8, Zone_Objective_StartPlayingObjective);
+        VirtualSwap(DefaultObjBase->VFTable, ZoneFinder::Fixed730::ObjectiveStopSlot / 8, Zone_Objective_StopObjective);
         LOG_INFO(LogDev, "Zone: hooked AFortObjectiveBase virtual methods (ActivateObjective, StartPlayingObjective, StopObjective)");
     }
 
@@ -1121,7 +1354,19 @@ static bool Zone_ListenOnce()
     }
 
     GetWorld()->Listen();
+
+    // the island start used to set this from its own driver; it is the Zone world's driver that matters now
+    if (auto ZoneDriver = GetWorld()->GetNetDriver())
+    {
+        static auto ReplicationDriverOffset = ZoneDriver->GetOffset("ReplicationDriver", false);
+        Globals::bShouldUseReplicationGraph = ReplicationDriverOffset != -1 && Fortnite_Version < 20 && Fortnite_Version != 3.3;
+        LOG_INFO(LogDev, "Zone: bShouldUseReplicationGraph {}", Globals::bShouldUseReplicationGraph);
+    }
+
     Globals::bStartedListening = true;
+
+    // the reservation beacon and the backend registration the game's own matchmaking needs (ZoneMatchmaking.cpp)
+    Zone::StartMatchmaking();
 
     if (RebootConfig::Get().Stw.Replication == "graph") Zone_RouteQuickBars();
 
@@ -1151,10 +1396,13 @@ static bool Zone_ListenOnce()
                 alignas(16) uint8_t Record[0x80] = {};
                 static auto MgrClassOffset = GameMode->GetOffset("MissionManagerClass", false);
                 UObject* MgrClass = MgrClassOffset != -1 ? GameMode->Get<UObject*>(MgrClassOffset) : nullptr;
-                auto InitRecord = (void (*)(void*, UObject*))(__int64(GetModuleHandleW(0)) + 0x1205c90);
-                InitRecord(Record, MgrClass);
-                auto LoadMissionMgr = (void (*)(UObject*, void*))(ZoneGameState->VFTable[0x770 / 8]);
-                LoadMissionMgr(ZoneGameState, Record);
+                auto InitRecord = (void (*)(void*, UObject*))ZoneFinder::InitMissionManagerRecord();
+                if (InitRecord)
+                {
+                    InitRecord(Record, MgrClass);
+                    auto LoadMissionMgr = (void (*)(UObject*, void*))(ZoneGameState->VFTable[ZoneFinder::Fixed730::GameStateLoadMissionManagerSlot / 8]);
+                    LoadMissionMgr(ZoneGameState, Record);
+                }
                 MissionMgr = ZoneGameState->Get<UObject*>("MissionManager");
             }
             LOG_INFO(LogDev, "Zone: GameState MissionManager is {}", MissionMgr ? MissionMgr->GetFullName() : "NULL");
@@ -1163,17 +1411,25 @@ static bool Zone_ListenOnce()
         static auto AIDirectorOffset = GameMode->GetOffset("AIDirector", false);
         if (AIDirectorOffset != -1 && !GameMode->Get<UObject*>(AIDirectorOffset))
         {
-            static auto DirectorClass = FindObject<UClass>(L"/Script/FortniteGame.FortAIDirector");
+            // The Zone blueprint director carries the spawn caps, graphs and settings (the bare native class has MaxTotalActiveAliveAI 0, which is
+            // what the log showed); another STW server (Limbo) runs the same blueprint. The native class is the fallback.
+            static auto DirectorClass = []() -> UClass*
+            {
+                auto Blueprint = LoadObject<UClass>(L"/Game/AIDirector/AIDirector_Fortnite.AIDirector_Fortnite_C", FindObject<UClass>(L"/Script/Engine.BlueprintGeneratedClass"));
+                LOG_INFO(LogDev, "Zone: director blueprint class {}", Blueprint ? "loaded" : "NOT FOUND, using the native class");
+                return Blueprint ? Blueprint : FindObject<UClass>(L"/Script/FortniteGame.FortAIDirector");
+            }();
             auto Director = DirectorClass ? GetWorld()->SpawnActor<AActor>(DirectorClass, FVector(), FQuat()) : nullptr;
             if (Director)
             {
                 GameMode->Get<UObject*>(AIDirectorOffset) = Director;
+                Zone::SyncDirectorDefaults(Director);
                 static auto UseProtoOffset = Director->GetOffset("bUsePrototypeEnemies", false);
                 if (UseProtoOffset != -1) SetBitfield(Director->GetPtr<PlaceholderBitfield>(UseProtoOffset), 1, true);
                 if (Fortnite_Version >= 7.3 && Fortnite_Version < 8.0)
                 {
-                    auto ActivateDirector = (void (*)(UObject*))(__int64(GetModuleHandleW(0)) + 0xb39370);
-                    ActivateDirector(Director);
+                    if (auto ActivateDirector = (void (*)(UObject*))ZoneFinder::ActivateAIDirector())
+                        ActivateDirector(Director);
                 }
             }
             LOG_INFO(LogDev, "Zone: AI director {}", Director ? Director->GetFullName() : "could not be created");
@@ -1182,7 +1438,11 @@ static bool Zone_ListenOnce()
         static auto AIGoalManagerOffset = GameMode->GetOffset("AIGoalManager", false);
         if (AIGoalManagerOffset != -1 && !GameMode->Get<UObject*>(AIGoalManagerOffset))
         {
-            static auto GoalMgrClass = FindObject<UClass>(L"/Script/FortniteGame.FortAIGoalManager");
+            static auto GoalMgrClass = []() -> UClass*
+            {
+                auto Blueprint = LoadObject<UClass>(L"/Game/AI/GoalSelection/AIGoalManager.AIGoalManager_C", FindObject<UClass>(L"/Script/Engine.BlueprintGeneratedClass"));
+                return Blueprint ? Blueprint : FindObject<UClass>(L"/Script/FortniteGame.FortAIGoalManager");
+            }();
             auto GoalMgr = GoalMgrClass ? GetWorld()->SpawnActor<AActor>(GoalMgrClass, FVector(), FQuat()) : nullptr;
             if (GoalMgr)
             {
@@ -1197,14 +1457,31 @@ static bool Zone_ListenOnce()
             LOG_INFO(LogDev, "Zone: AI goal manager {}", GoalMgr ? GoalMgr->GetFullName() : "could not be created");
         }
 
-        if (RebootConfig::Get().Stw.Map.find("Onboarding") != std::string::npos)
+        // The outpost's storm shield core has to be in the world before its mission loads: Mission_Outpost's InitMission looks for it then
+        // (InitBuildingData -> StoreStormShieldEggAndPingLocation -> SaveLocationofOutpostEgg sets EggLocation, where the shield dome is spawned).
+        // Spawned at the match start it came too late: EggLocation stayed (0, 0, 0), the dome stood at the map origin with the core near its
+        // edge and looked small from there (2026-11-07).
         {
-            auto MissionInfo = LoadObject<UObject>(L"/Game/Missions/Primary/OB_FarmsteadFort/OB_FarmsteadFort.OB_FarmsteadFort", FindObject<UClass>(L"/Script/FortniteGame.FortMissionInfo"));
+            static auto OutpostGameModeClass = FindObject<UClass>(L"/Script/FortniteGame.FortGameModeOutpost");
+            if (OutpostGameModeClass && GameMode->IsA(OutpostGameModeClass)) Zone_SpawnOutpostCoreEgg();
+        }
+
+        // The primary mission comes from the mission generator of the mission's tile (MissionGen_TheOutpost_PARENT lists MissionInfo_Outpost_PvE_01
+        // for Storm Shield Defense 1); the backend that starts this server passes it as SaveTheWorld.Mission. The tutorial map keeps its own mission.
+        std::string MissionPath = RebootConfig::Get().Stw.Mission;
+        if (MissionPath.empty() && RebootConfig::Get().Stw.Map.find("Onboarding") != std::string::npos)
+            MissionPath = "/Game/Missions/Primary/OB_FarmsteadFort/OB_FarmsteadFort.OB_FarmsteadFort";
+
+        if (!MissionPath.empty())
+        {
+            const std::wstring WideMissionPath = RebootConfig::Widen(MissionPath);
+            auto MissionInfo = LoadObject<UObject>(WideMissionPath.c_str(), FindObject<UClass>(L"/Script/FortniteGame.FortMissionInfo"));
             static auto LoadMissionFn = FindObject<UFunction>(L"/Script/FortniteGame.FortMissionLibrary.LoadMission");
             static auto MissionLibrary = FindObject<UObject>(L"/Script/FortniteGame.Default__FortMissionLibrary");
 
             if (MissionInfo && LoadMissionFn && MissionLibrary)
             {
+                Zone::SetMissionInfo(MissionInfo);
                 alignas(16) unsigned char Params[64] = {};
                 *(UObject**)(Params) = (UObject*)GetWorld();
                 *(UObject**)(Params + 8) = MissionInfo;
@@ -1214,26 +1491,18 @@ static bool Zone_ListenOnce()
             else LOG_ERROR(LogDev, "Zone: could not load the mission (info {}, function {}, library {})", (bool)MissionInfo, (bool)LoadMissionFn, (bool)MissionLibrary);
         }
 
-        // Start playing all loaded missions now so OB_FarmsteadFort_C has MissionStatus == InProgress (1) before the player spawns.
-        if (auto ZoneGameState = ((UObject*)GetWorld())->Get<UObject*>("GameState"))
+        // Start playing all loaded missions now so OB_FarmsteadFort_C has MissionStatus == InProgress (1) before the player spawns. Not on the
+        // outpost: Mission_Outpost chooses its leg when it starts (InitMission asks for the outpost owner's quest config). Started here, with
+        // nobody in yet, it found no quest, put the storm shield up and skipped the intro movie and the tutorial dialogue (2026-11-07); it is
+        // started with the match instead, once the owner's quests are on the server (Zone_TickPendingMatchStart).
+        static auto OutpostGameModeClass = FindObject<UClass>(L"/Script/FortniteGame.FortGameModeOutpost");
+        if (OutpostGameModeClass && GameMode->IsA(OutpostGameModeClass))
         {
-            if (auto MissionMgr = ZoneGameState->Get<UObject*>("MissionManager"))
-            {
-                static int MissionsOffset = MissionMgr->GetOffset("Missions", false);
-                if (MissionsOffset != -1)
-                {
-                    auto& Missions = MissionMgr->Get<TArray<UObject*>>(MissionsOffset);
-                    auto StartPlayingMission = (void (*)(UObject*, UObject*))(MissionMgr->VFTable[0x600 / 8]);
-                    for (int i = 0; i < Missions.Num(); ++i)
-                    {
-                        if (auto Mission = Missions.at(i))
-                        {
-                            StartPlayingMission(MissionMgr, Mission);
-                            LOG_INFO(LogDev, "Zone: started mission {} (status {})", Mission->GetFullName(), (int)*((uint8_t*)Mission + 0x488));
-                        }
-                    }
-                }
-            }
+            LOG_INFO(LogDev, "Zone: outpost missions wait for the match start");
+        }
+        else
+        {
+            Zone_StartLoadedMissions();
         }
 
         // Drain WorldSettings->WorldReadyActors so AFortAIDirector::WorldReady, AFortMission::OnWorldReady, and AFortObjectiveBase::OnWorldReady execute!
@@ -1243,9 +1512,11 @@ static bool Zone_ListenOnce()
             {
                 if (auto WorldSettings = PersistentLevel->Get<UObject*>("WorldSettings"))
                 {
-                    auto NotifyWorldReady = (void (*)(UObject*))(__int64(GetModuleHandleW(0)) + 0x11282c0);
-                    NotifyWorldReady(WorldSettings);
-                    LOG_INFO(LogDev, "Zone: called AFortWorldSettings::NotifyWorldReady on {}", WorldSettings->GetFullName());
+                    if (auto NotifyWorldReady = (void (*)(UObject*))ZoneFinder::NotifyWorldReady())
+                    {
+                        NotifyWorldReady(WorldSettings);
+                        LOG_INFO(LogDev, "Zone: called AFortWorldSettings::NotifyWorldReady on {}", WorldSettings->GetFullName());
+                    }
                 }
             }
         }
@@ -1266,32 +1537,15 @@ static bool Zone_ReadyToStartMatchHook(UObject* GameMode)
 
 // Runs every frame on the game thread (the engine asks for the tick rate). When the server has travelled to a Zone (Save the World) map it starts listening
 // a moment after the map came up, the same thing the Athena ReadyToStartMatch hook does for Battle Royale.
-// Zone tracing (only when [SaveTheWorld] Map is set): logs calls of the world manager's load machine. Addresses are RVAs of 7.20 (names from the Xbox 7.30 symbols, see fnmod/re).
-static __int64 (*Trace_HandleLoadingOriginal)(__int64, __int64, __int64, __int64);
+// Zone tracing (only when [SaveTheWorld] Map is set): logs calls of the world manager's load machine. The functions are found by signature (ZoneFinder.h).
 static __int64 (*Trace_RetrieveZoneCompleteOriginal)(__int64, __int64, __int64, __int64);
 static __int64 (*Trace_RetrieveTheaterCompleteOriginal)(__int64, __int64, __int64, __int64);
 static __int64 (*Trace_CreateWorldRecordOriginal)(__int64, __int64, __int64, __int64);
 static __int64 (*Trace_InitWorldRecordCompleteOriginal)(__int64, __int64, __int64, __int64);
 
-static __int64 Trace_HandleLoadingHook(__int64 A, __int64 B, __int64 C, __int64 D)
-{
-    static unsigned char LastState[4] = { 255, 255, 255, 255 };
-    auto State = *(__int64*)(A + 0x7d8);
-    unsigned char Now[4] = { 0, 0, 0, 0 };
-    if (State) for (int i = 0; i < 4; ++i) Now[i] = *(unsigned char*)(State + i);
-
-    if (State && memcmp(Now, LastState, 4) != 0)
-    {
-        memcpy(LastState, Now, 4);
-        LOG_INFO(LogDev, "ZoneTrace HandleLoadingWorldRecordState: state bytes {} {} {} {} (count {})", Now[0], Now[1], Now[2], Now[3], *(int*)(A + 0x7e0));
-    }
-
-    return Trace_HandleLoadingOriginal(A, B, C, D);
-}
-
 static __int64 Trace_RetrieveZoneCompleteHook(__int64 A, __int64 B, __int64 C, __int64 D)
 {
-    LOG_INFO(LogDev, "ZoneTrace OnRetrieveZoneInformationComplete: result bytes {} {}", *(unsigned char*)B, *(unsigned char*)(B + 0x40));
+    LOG_INFO(LogDev, "ZoneTrace OnRetrieveZoneInformationComplete");
     return Trace_RetrieveZoneCompleteOriginal(A, B, C, D);
 }
 
@@ -1303,7 +1557,54 @@ static __int64 Trace_RetrieveTheaterCompleteHook(__int64 A, __int64 B, __int64 C
 
 static __int64 Trace_CreateWorldRecordHook(__int64 A, __int64 B, __int64 C, __int64 D)
 {
-    LOG_INFO(LogDev, "ZoneTrace CreateNewWorldRecord (info WorldId.Num {})", *(int*)(B + 8));
+    static int WorldIdOffset = FindOffsetStruct("/Script/FortniteGame.FortZoneInstanceInfo", "WorldId", false);
+    LOG_INFO(LogDev, "ZoneTrace CreateNewWorldRecord (info WorldId.Num {})", WorldIdOffset >= 0 && B ? ((FString*)(B + WorldIdOffset))->Data.Num() : -1);
+
+    // B is the zone instance info (FFortZoneInstanceInfo). Without a zone theme the world manager runs with no theme and places no player
+    // spawn pad (Storm Shield Defense 1: "theme NONE", the player spawned over nothing). The theme cannot come in the URL (zoneThemeClass
+    // there makes the Zone fetch the theater from the backend, which fails: "Unable to find service permissions for server"), so it is
+    // written into the info this record is made from.
+    // only the Zone's record: the island the server starts on makes one first
+    const std::string& ZoneTheme = RebootConfig::Get().Stw.ZoneTheme;
+    if (!ZoneTheme.empty() && B && GetWorld() && GetWorld()->GetName().starts_with("Zone_"))
+    {
+        static auto ThemeOffset = FindOffsetStruct("/Script/FortniteGame.FortZoneInstanceInfo", "ZoneThemeClass", false);
+        if (ThemeOffset >= 0)
+        {
+            auto& Theme = *(TSoftObjectPtr<UObject>*)(B + ThemeOffset);
+            if (!Theme.SoftObjectPtr.ObjectID.AssetPathName.ComparisonIndex.Value)
+            {
+                static const std::wstring WideTheme = RebootConfig::Widen(ZoneTheme);
+                Theme.SoftObjectPtr.ObjectID.AssetPathName = UKismetStringLibrary::Conv_StringToName(WideTheme.c_str());
+                LOG_INFO(LogDev, "ZoneTrace CreateNewWorldRecord: zone theme set to {} (at +0x{:x})", ZoneTheme, ThemeOffset);
+            }
+        }
+        else LOG_WARN(LogDev, "ZoneTrace CreateNewWorldRecord: FortZoneInstanceInfo has no ZoneThemeClass, theme not set");
+
+        // The record alone left the world manager's Theme empty (it is filled from the theater data a real server gets from the backend), and
+        // the world manager builds the zone right after this. So the theme object goes onto the world manager and the zone game state too:
+        // the theme class's default object.
+        static auto ThemeClass = LoadObject<UClass>(RebootConfig::Widen(ZoneTheme).c_str(), FindObject<UClass>(L"/Script/Engine.BlueprintGeneratedClass"));
+        UObject* ThemeObject = ThemeClass ? ThemeClass->CreateDefaultObject() : nullptr;
+
+        static auto WorldManagerClass = FindObject<UClass>(L"/Script/FortniteGame.FortWorldManager");
+        auto WorldManagers = WorldManagerClass ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), WorldManagerClass) : TArray<AActor*>();
+        UObject* WorldManager = WorldManagers.Num() > 0 ? WorldManagers.at(0) : nullptr;
+        WorldManagers.Free();
+
+        if (ThemeObject && WorldManager)
+        {
+            static auto WorldManagerThemeOffset = WorldManager->GetOffset("Theme");
+            if (!WorldManager->Get<UObject*>(WorldManagerThemeOffset)) WorldManager->Get<UObject*>(WorldManagerThemeOffset) = ThemeObject;
+        }
+
+        UObject* GameState = ((UObject*)GetWorld())->Get<UObject*>("GameState");
+        static auto GameStateThemeOffset = GameState ? GameState->GetOffset("ZoneTheme", false) : -1;
+        if (ThemeObject && GameState && GameStateThemeOffset >= 0 && !GameState->Get<UObject*>(GameStateThemeOffset)) GameState->Get<UObject*>(GameStateThemeOffset) = ThemeObject;
+
+        LOG_INFO(LogDev, "ZoneTrace CreateNewWorldRecord: theme object {} given to world manager {} and game state {}", ThemeObject ? ThemeObject->GetName() : "NONE (class did not load)",
+            WorldManager ? WorldManager->GetName() : "NONE", GameState && GameStateThemeOffset >= 0 ? GameState->GetName() : "NONE");
+    }
     return Trace_CreateWorldRecordOriginal(A, B, C, D);
 }
 
@@ -1328,31 +1629,110 @@ static void* GetPawnGoalSelectionCriteriaHook(void* FortAIPawn, void* CriteriaLi
     return GetPawnGoalSelectionCriteriaOriginal(FortAIPawn, CriteriaList);
 }
 
+static void InstallZoneTrace();
+static void Zone_InstallStwFixHooks(); // defined right below InstallZoneTrace
+
 static void InstallZoneTrace()
 {
-    const auto Base = __int64(GetModuleHandleW(0));
-    // exe addresses of the world record callbacks; 7.30.1 (CL 4834550) values were ported from 7.20 by byte matching (fnmod/re/port730c.py)
-    const bool b730 = Fortnite_Version >= 7.3;
-    Hooking::MinHook::Hook((PVOID)(Base + (b730 ? 0x10fe6c0 : 0x10d54e0)), Trace_RetrieveZoneCompleteHook, (PVOID*)&Trace_RetrieveZoneCompleteOriginal);
-    Hooking::MinHook::Hook((PVOID)(Base + (b730 ? 0x10fe600 : 0x10d5420)), Trace_RetrieveTheaterCompleteHook, (PVOID*)&Trace_RetrieveTheaterCompleteOriginal);
-    Hooking::MinHook::Hook((PVOID)(Base + (b730 ? 0x10f0750 : 0x10c7820)), Trace_CreateWorldRecordHook, (PVOID*)&Trace_CreateWorldRecordOriginal);
-    Hooking::MinHook::Hook((PVOID)(Base + (b730 ? 0x1008700 : 0xfe4110)), Trace_InitWorldRecordCompleteHook, (PVOID*)&Trace_InitWorldRecordCompleteOriginal);
-    if (b730)
+    // the world record callbacks, found by signature (ZoneFinder.h; the signatures are 7.30's, and ZoneFinder answers 0 on other builds)
+    if (auto A = ZoneFinder::OnRetrieveZoneInformationComplete()) Hooking::MinHook::Hook((PVOID)A, Trace_RetrieveZoneCompleteHook, (PVOID*)&Trace_RetrieveZoneCompleteOriginal);
+    if (auto A = ZoneFinder::OnRetrieveTheaterInformationComplete()) Hooking::MinHook::Hook((PVOID)A, Trace_RetrieveTheaterCompleteHook, (PVOID*)&Trace_RetrieveTheaterCompleteOriginal);
+    if (auto A = ZoneFinder::CreateNewWorldRecord()) Hooking::MinHook::Hook((PVOID)A, Trace_CreateWorldRecordHook, (PVOID*)&Trace_CreateWorldRecordOriginal);
+    if (auto A = ZoneFinder::OnInitWorldRecordComplete()) Hooking::MinHook::Hook((PVOID)A, Trace_InitWorldRecordCompleteHook, (PVOID*)&Trace_InitWorldRecordCompleteOriginal);
+    if (auto A = ZoneFinder::GetPawnGoalSelectionCriteria())
     {
-        Hooking::MinHook::Hook((PVOID)(Base + 0xbd95e0), (PVOID)GetPawnGoalSelectionCriteriaHook, (PVOID*)&GetPawnGoalSelectionCriteriaOriginal);
-        LOG_INFO(LogDev, "Zone: GetPawnGoalSelectionCriteria hooked at 0xbd95e0.");
+        Hooking::MinHook::Hook((PVOID)A, (PVOID)GetPawnGoalSelectionCriteriaHook, (PVOID*)&GetPawnGoalSelectionCriteriaOriginal);
+        LOG_INFO(LogDev, "Zone: GetPawnGoalSelectionCriteria hooked.");
     }
-    LOG_INFO(LogDev, "Zone trace hooks installed.");
+    LOG_INFO(LogDev, "Zone trace hooks installed. Engine_Version={}", Engine_Version);
+    Zone_InstallStwFixHooks();
+}
+
+// ---------------- Save the World: crafted-item quickbar repair ----------------
+// AFortPlayerController::AddItemToQuickBars (native 0x13d4eb0, byte-ported from 7.20 and confirmed against the
+// 7.30.1 exe) resolves its argument through the world inventory and answers "could not find specified item"
+// when the item is not there. The param dump at install read: ItemDefinition@0 QuickBarType@8 SlotIndex@12 —
+// the first argument is the item DEFINITION object, not a guid. The mission uses this call to hand the player
+// the crafting schematic (searching the tutorial pit chest pushed SID_Edged_Sword_Medium_C_Ore_T00 here), and
+// since the schematic is never in the world inventory on this server, it never lands: no schematic in the
+// inventory means the crafting subobjectives never spawn and crafting produces nothing.
+// Repair: when the definition is missing from the world inventory, grant it (with the ShouldShowItemToast
+// state so the client shows the pickup feed); otherwise place the existing instance's guid into its quickbar.
+// The ExecuteInventoryItem hook is deliberately NOT installed: the direct-equip bypass crashed (access
+// violation at dll+0x318770) because the crafted item's definition-class layout was assumed, not known.
+static void (*Zone_AddItemToQuickBarsOriginal)(UObject* PlayerController, void* Item, bool bUpdate, int Slot) = nullptr;
+
+static void Zone_AddItemToQuickBarsHook(UObject* PlayerController, void* Item, bool bUpdate, int Slot)
+{
+    Zone_AddItemToQuickBarsOriginal(PlayerController, Item, bUpdate, Slot);
+    if (!Item || !PlayerController) return;
+
+    auto MaybeObject = (UObject*)Item;
+    static auto DefinitionClass = FindObject<UClass>(L"/Script/FortniteGame.FortItemDefinition");
+    if (!MaybeObject->IsValidLowLevel() || !MaybeObject->ClassPrivate || !DefinitionClass || !MaybeObject->IsA(DefinitionClass))
+        return;
+
+    auto PlayerControllerFort = (AFortPlayerController*)PlayerController;
+    auto WorldInventory = PlayerControllerFort->GetWorldInventory();
+    if (!WorldInventory) return;
+
+    auto Definition = (UFortItemDefinition*)MaybeObject;
+
+    // Schematics (FortSchematicItemDefinition) are not FortWorldItemDefinitions — they go through a
+    // different inventory system and GrantItemWithToast would crash on them. Skip granting schematics
+    // here; the mission will need its own schematic-grant path.
+    static auto WorldItemDefClass = FindObject<UClass>(L"/Script/FortniteGame.FortWorldItemDefinition");
+    if (!Definition->IsA(WorldItemDefClass))
+    {
+        LOG_WARN(LogDev, "Zone: AddItemToQuickBars skipped non-world-item definition (likely a schematic): {}", Definition->GetPathName());
+        return;
+    }
+
+    // the native cannot place what the inventory does not hold: grant it (toast + quickbar) and stop
+    auto ItemInstance = WorldInventory->FindItemInstance(Definition);
+    if (!ItemInstance)
+    {
+        LOG_INFO(LogDev, "Zone: AddItemToQuickBars got a definition that is not in the world inventory, granting it: {}", Definition->GetPathName());
+        Zone::GrantItemWithToast(PlayerControllerFort, Definition, 1);
+        return;
+    }
+
+    auto Entry = ItemInstance->GetItemEntry();
+    if (!Entry) return;
+    auto ItemGuid = Entry->GetItemGuid();
+
+    auto QuickBarsOffset = PlayerController->GetOffset("QuickBars", false);
+    auto QuickBarsActor = QuickBarsOffset != -1 ? PlayerController->Get<AActor*>(QuickBarsOffset) : nullptr;
+    if (!QuickBarsActor || !QuickBarsActor->IsValidLowLevel()) return;
+    if (((AFortQuickBars*)QuickBarsActor)->GetSlotIndex(ItemGuid, EFortQuickBars::Primary) >= 0)
+        return; // the native did place it (or our earlier repair did); nothing to do
+
+    static auto ServerAddItemInternalFn = FindObject<UFunction>(L"/Script/FortniteGame.FortQuickBars.ServerAddItemInternal");
+    if (ServerAddItemInternalFn)
+    {
+        struct { FGuid Item; uint8_t InQuickBar; int Slot; } AddParams{ ItemGuid, (uint8_t)(IsPrimaryQuickbar(Definition) ? 0 : 1), -1 };
+        QuickBarsActor->ProcessEvent(ServerAddItemInternalFn, &AddParams);
+        LOG_INFO(LogDev, "Zone: placed {} into the quickbar after the native add failed (mission requested slot {})", Definition->GetPathName(), Slot);
+    }
+}
+
+static void Zone_InstallStwFixHooks()
+{
+    // AFortPlayerController::AddItemToQuickBars (found by signature, ZoneFinder.h)
+    auto AddItemToQuickBars = ZoneFinder::AddItemToQuickBars();
+    if (!AddItemToQuickBars)
+    {
+        LOG_WARN(LogDev, "Zone: craft hooks skipped, AddItemToQuickBars was not found (Engine_Version={})", Engine_Version);
+        return;
+    }
+
+    Hooking::MinHook::Hook((PVOID)AddItemToQuickBars, Zone_AddItemToQuickBarsHook, (PVOID*)&Zone_AddItemToQuickBarsOriginal);
+    LOG_INFO(LogDev, "Zone: AddItemToQuickBars repair hook installed.");
 }
 
 static void Zone_ApplyHeroSkin(AFortPlayerPawn* Pawn, UObject* Hero)
 {
     if (!Pawn || !Hero) return;
-
-    static auto HeadClass = FindObject<UClass>(L"/Script/FortniteGame.CustomCharacterHeadData");
-    static auto BodyClass = FindObject<UClass>(L"/Script/FortniteGame.CustomCharacterBodyData");
-    static auto HatClass = FindObject<UClass>(L"/Script/FortniteGame.CustomCharacterHatData");
-    static auto BackpackClass = FindObject<UClass>(L"/Script/FortniteGame.CustomCharacterBackpackData");
 
     static auto PartsOffset = Hero->GetOffset("CharacterParts", false);
     if (PartsOffset == -1)
@@ -1364,8 +1744,13 @@ static void Zone_ApplyHeroSkin(AFortPlayerPawn* Pawn, UObject* Hero)
 
     auto& Parts = Hero->Get<TArray<UObject*>>(PartsOffset);
     TArray<UObject*> CosmeticParts;
-    int Heads = 0, Bodies = 0, Hats = 0, Backpacks = 0, Unknown = 0;
+    int Counts[(int)EFortCustomPartType::NumTypes] = {};
+    int Unknown = 0;
+    std::string Names;
 
+    // Each part says what it is (CustomCharacterPart.CharacterPartType, EFortCustomPartType). Sorting by the AdditionalData class missed every
+    // body: that class is CustomCharacterBodyPartData on this build, not CustomCharacterBodyData, so the hero's body was never chosen and the
+    // pawn kept its default one under the hero's head and hat (legs clipping through, 2026-11-07); face and charm parts were dropped the same way.
     for (int i = 0; i < Parts.Num(); ++i)
     {
         auto Part = Parts.at(i);
@@ -1373,14 +1758,16 @@ static void Zone_ApplyHeroSkin(AFortPlayerPawn* Pawn, UObject* Hero)
 
         CosmeticParts.Add(Part);
 
-        static auto AdditionalDataOffset = Part->GetOffset("AdditionalData", false);
-        auto AddData = AdditionalDataOffset != -1 ? Part->Get<UObject*>(AdditionalDataOffset) : nullptr;
-        if (!AddData) { ++Unknown; continue; }
+        static auto PartTypeOffset = Part->GetOffset("CharacterPartType", false);
+        const int Type = PartTypeOffset != -1 ? Part->Get<uint8>(PartTypeOffset) : -1;
 
-        if (HeadClass && AddData->IsA(HeadClass)) { Pawn->ServerChoosePart(EFortCustomPartType::Head, Part); ++Heads; }
-        else if (BodyClass && AddData->IsA(BodyClass)) { Pawn->ServerChoosePart(EFortCustomPartType::Body, Part); ++Bodies; }
-        else if (HatClass && AddData->IsA(HatClass)) { Pawn->ServerChoosePart(EFortCustomPartType::Hat, Part); ++Hats; }
-        else if (BackpackClass && AddData->IsA(BackpackClass)) { Pawn->ServerChoosePart(EFortCustomPartType::Backpack, Part); ++Backpacks; }
+        Names += (Names.empty() ? "" : ", ") + Part->GetName() + "=" + std::to_string(Type);
+
+        if (Type >= 0 && Type < (int)EFortCustomPartType::NumTypes)
+        {
+            Pawn->ServerChoosePart((EFortCustomPartType)Type, Part);
+            ++Counts[Type];
+        }
         else ++Unknown;
     }
 
@@ -1396,7 +1783,75 @@ static void Zone_ApplyHeroSkin(AFortPlayerPawn* Pawn, UObject* Hero)
     }
     CosmeticParts.Free();
     // the counts say which slots were actually chosen; "unknown" parts were skipped by type
-    LOG_INFO(LogDev, "Zone: applied STW hero skin: head {} body {} hat {} backpack {} unknown {} (of {} parts)", Heads, Bodies, Hats, Backpacks, Unknown, Parts.Num());
+    LOG_INFO(LogDev, "Zone: applied STW hero skin: head {} body {} hat {} backpack {} charm {} face {} unknown {} (of {} parts: {})", Counts[0], Counts[1], Counts[2], Counts[3],
+        Counts[4], Counts[5], Unknown, Parts.Num(), Names);
+}
+
+// Where a player's pawn goes: the player start the game mode itself picks (GameModeBase.FindPlayerStart, which the mission's game mode can
+// override), the first PlayerStart of the level when it picks none. The first PlayerStart alone was right on the tutorial map, but on Storm
+// Shield Defense 1 (Zone_Outpost_Stonewood) it had no ground under it: the player fell through the map at once and again after every respawn
+// (2026-11-07). The starts are logged once so a wrong one can be told from the log.
+static FVector Zone_StartLocationFor(AActor* Controller)
+{
+    static auto StartClass = FindObject<UClass>(L"/Script/Engine.PlayerStart");
+    auto Starts = StartClass ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), StartClass) : TArray<AActor*>();
+
+    static bool bListed = false;
+    if (!bListed)
+    {
+        bListed = true;
+        for (int i = 0; i < Starts.Num() && i < 24; ++i)
+        {
+            auto Start = Starts.at(i);
+            const FVector Location = Start->GetActorLocation();
+            LOG_INFO(LogDev, "Zone: player start {} of {}: {} at ({:.0f}, {:.0f}, {:.0f})", i, Starts.Num(), Start->GetName(), Location.X, Location.Y, Location.Z);
+        }
+    }
+
+    AActor* Chosen = nullptr;
+    UObject* GameMode = GetWorld()->Get<UObject*>("AuthorityGameMode");
+    static auto FindPlayerStartFn = FindObject<UFunction>(L"/Script/Engine.GameModeBase.FindPlayerStart");
+    if (GameMode && FindPlayerStartFn)
+    {
+        struct { AActor* Player; FString IncomingName; AActor* ReturnValue; } Params{ Controller, FString(), nullptr };
+        GameMode->ProcessEvent(FindPlayerStartFn, &Params);
+        Chosen = Params.ReturnValue;
+    }
+
+    const char* Source = "the game mode's choice";
+    if (!Chosen && Starts.Num() > 0)
+    {
+        Chosen = Starts.at(0);
+        Source = "the first PlayerStart (the game mode chose none)";
+    }
+    Starts.Free();
+
+    FVector Location{};
+    if (Chosen)
+    {
+        Location = Chosen->GetActorLocation();
+        Location.Z += 150;
+    }
+
+    // On the outpost the only start is a FortPlayerStart left at the origin with nothing under it: a real server's world generation puts the
+    // player spawn (the outpost's teleport pad) where the map's PlayerSpawnPlacementActor stands, (-3584, 0, 768) on Zone_Outpost_Stonewood,
+    // and that generation does not run here. So a start at the origin gives way to the placement actor.
+    const FVector At = Chosen ? Chosen->GetActorLocation() : FVector{};
+    if (!Chosen || (fabs(At.X) < 1 && fabs(At.Y) < 1 && fabs(At.Z) < 1))
+    {
+        static auto PlacementClass = LoadObject<UClass>(L"/Game/Building/ObjectivePlacementActors/PlayerSpawnPlacementActor.PlayerSpawnPlacementActor_C", FindObject<UClass>(L"/Script/Engine.BlueprintGeneratedClass"));
+        auto Placements = PlacementClass ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), PlacementClass) : TArray<AActor*>();
+        if (Placements.Num() > 0)
+        {
+            Location = Placements.at(0)->GetActorLocation();
+            Location.Z += 150;
+            Source = "the map's player spawn placement (the start was at the origin)";
+            Chosen = Placements.at(0);
+        }
+        Placements.Free();
+    }
+    LOG_INFO(LogDev, "Zone: pawn start for {}: {} {} at ({:.0f}, {:.0f}, {:.0f})", Controller->GetName(), Source, Chosen ? Chosen->GetName() : "NONE", Location.X, Location.Y, Location.Z);
+    return Location;
 }
 
 // Save the World: what the Zone game mode does not do for a player on this build. The player needs quickbars and a world inventory (the client waits for them in
@@ -1414,32 +1869,26 @@ static bool gZoneHeroInitialized = false;
 
 static void Zone_SetUpPlayer(UObject* GameMode, AActor* NewPlayer)
 {
-    static std::vector<AActor*> SetUp;
+    // Players are remembered by address AND object name: a leaving player's controller is freed, and the next player's controller can be handed the same
+    // address before this ever runs again (it only runs while a controller exists), so the address alone made a rejoin look already set up and it hung on loading.
+    static std::vector<std::pair<AActor*, std::string>> SetUp;
 
-    // drop players that have left: a freed actor's address can be handed to a new player, which must still be set up
-    SetUp.erase(std::remove_if(SetUp.begin(), SetUp.end(), [](AActor* Actor) { return !Actor || !Actor->IsValidLowLevel(); }), SetUp.end());
+    SetUp.erase(std::remove_if(SetUp.begin(), SetUp.end(), [](const std::pair<AActor*, std::string>& Entry)
+    {
+        return !Entry.first || !Entry.first->IsValidLowLevel() || Entry.first->GetName() != Entry.second;
+    }), SetUp.end());
 
-    if (!NewPlayer || NewPlayer == GetLocalPlayerController() || std::find(SetUp.begin(), SetUp.end(), NewPlayer) != SetUp.end())
+    if (!NewPlayer || NewPlayer == GetLocalPlayerController()
+        || std::find_if(SetUp.begin(), SetUp.end(), [&](const std::pair<AActor*, std::string>& Entry) { return Entry.first == NewPlayer; }) != SetUp.end())
         return;
 
-    SetUp.push_back(NewPlayer);
+    SetUp.push_back({ NewPlayer, NewPlayer->GetName() });
     LOG_INFO(LogDev, "Zone: setting up the player {}", NewPlayer->GetName());
 
-    // Enable building for this player immediately (STW building is on from the start, not gated by mission)
-    {
-        // Per-player build free flag
-        int bBuildFreeOffset = NewPlayer->GetOffset("bBuildFree", false);
-        if (bBuildFreeOffset != -1)
-        {
-            void* Prop = NewPlayer->GetProperty("bBuildFree", false);
-            uint8_t Mask = GetFieldMask(Prop);
-            NewPlayer->SetBitfieldValue(bBuildFreeOffset, Mask, true);
-            LOG_INFO(LogDev, "Zone: enabled bBuildFree on {}", NewPlayer->GetName());
-        }
-
-        // Also call the GameState's SetBuildingAllowed (idempotent)
-        Zone_AllowBuilding();
-    }
+    // Enable building for this player immediately (STW building is on from the start, not gated by mission). This used to also set the
+    // controller's bBuildFree, but that is the free-build cheat flag: nothing ever cost materials (wood stuck at 30). Pieces are paid for
+    // in ServerCreateBuildingActorHook's Zone branch now.
+    Zone_AllowBuilding();
 
     auto SpawnOwned = [&](const wchar_t* ClassPath, const char* Property) -> AActor*
     {
@@ -1491,24 +1940,13 @@ static void Zone_SetUpPlayer(UObject* GameMode, AActor* NewPlayer)
         if (OnRepOwner) PlayerState->ProcessEvent(OnRepOwner);
     }
 
-    // a pawn at the first player start of the level
+    // a pawn at the player start the game mode picks
     static auto PawnClass = LoadObject<UClass>(L"/Game/Abilities/Player/Pawns/PlayerPawn_Generic.PlayerPawn_Generic_C", FindObject<UClass>(L"/Script/CoreUObject.Class"));
-    static auto StartClass = FindObject<UClass>(L"/Script/Engine.PlayerStart");
 
     FTransform Transform;
     Transform.Rotation = FQuat(0, 0, 0, 1);
     Transform.Scale3D = FVector(1, 1, 1);
-
-    if (StartClass)
-    {
-        auto Starts = UGameplayStatics::GetAllActorsOfClass(GetWorld(), StartClass);
-        if (Starts.Num() > 0)
-        {
-            Transform.Translation = Starts.at(0)->GetActorLocation();
-            Transform.Translation.Z += 150;
-        }
-        Starts.Free();
-    }
+    Transform.Translation = Zone_StartLocationFor(NewPlayer);
 
     if (PawnClass)
     {
@@ -1587,6 +2025,9 @@ static void Zone_SetUpPlayer(UObject* GameMode, AActor* NewPlayer)
                     }
 
                     LOG_INFO(LogDev, "Zone: starter kit given (building tools + edit tool)");
+
+                    // and what the player carried out of their last mission
+                    Zone::LoadBackpack(Controller);
                 }
 
                 // In STW, do not apply Athena Ramirez (CID_001_Athena_Commando_F_Default) because its BR body/pants mesh conflicts with the STW hero.
@@ -1600,31 +2041,44 @@ static void Zone_SetUpPlayer(UObject* GameMode, AActor* NewPlayer)
                 if (AcknowledgedPawnOffset != -1) NewPlayer->Get<AActor*>(AcknowledgedPawnOffset) = Pawn;
             }
 
-            // chunk 3: the onboarding mission wants husks around the farm (Build60+ test)
-            // Off by default: spawning HuskPawn_C crashes the server (engine +0xbd9660). Enable with -reboot.SaveTheWorld.SpawnHusks=true or [SaveTheWorld] SpawnHusks=true to debug it.
-            if (RebootConfig::Get().Stw.bSpawnHusks)
-                Zone::SpawnInitialWave((AFortPlayerPawn*)Pawn);
-
             // The Zone loading screen stays up until the server marks the player as having finished loading (bHasServerFinishedLoading, replicated; the client then answers with its
             // own flag and the player state's). The native loading tick never gets there because there is no zone data, so do what it ends with. 7.30.1: AFortPlayerController::SetHasFinishedLoading.
             if (Fortnite_Version >= 7.3 && Fortnite_Version < 8.0)
             {
-                auto SetHasFinishedLoading = (void (*)(UObject*, bool))(__int64(GetModuleHandleW(0)) + 0x1418ba0);
-                SetHasFinishedLoading(NewPlayer, true);
-                LOG_INFO(LogDev, "Zone: the player is marked as having finished loading");
+                if (auto SetHasFinishedLoading = (void (*)(UObject*, bool))ZoneFinder::SetHasFinishedLoading())
+                {
+                    SetHasFinishedLoading(NewPlayer, true);
+                    LOG_INFO(LogDev, "Zone: the player is marked as having finished loading");
+                }
             }
 
             if (!gZoneMatchStarted)
             {
                 gZoneMatchStarted = true;
-                static auto StartMatchFn = FindObject<UFunction>(L"/Script/Engine.GameMode.StartMatch");
-                if (StartMatchFn) GameMode->ProcessEvent(StartMatchFn);
-                LOG_INFO(LogDev, "Zone: match started after player setup");
+
+                // Storm Shield Defense chooses its leg when the match starts (Mission_Outpost OnMatchStarted asks for the outpost owner's quest
+                // config). Started here the owner's quests were not on the server yet: the mission saw no active quest, put the storm shield
+                // up and skipped the intro movie and the tutorial dialogue (2026-11-07; the config came ~4 s later, after the profile loaded).
+                // So on the outpost the start waits for that config (Zone_TickPendingMatchStart); the tutorial starts at once as before.
+                static auto OutpostGameModeClass = FindObject<UClass>(L"/Script/FortniteGame.FortGameModeOutpost");
+                if (OutpostGameModeClass && GameMode->IsA(OutpostGameModeClass))
+                {
+                    gZoneMatchStartPending = true;
+                    gZoneMatchStartRequestedAt = std::chrono::steady_clock::now();
+                    LOG_INFO(LogDev, "Zone: outpost match start waits for the owner's quest config");
+                }
+                else
+                {
+                    static auto StartMatchFn = FindObject<UFunction>(L"/Script/Engine.GameMode.StartMatch");
+                    if (StartMatchFn) GameMode->ProcessEvent(StartMatchFn);
+                    LOG_INFO(LogDev, "Zone: match started after player setup");
+                }
             }
 
             gZoneRestartController = NewPlayer;
             gZoneRestartFrames = 0;
             gZoneRestartsSent = 0;
+            gZoneHeroInitialized = false; // each joining player needs the hero, skin and abilities, not only the first
         }
         else LOG_ERROR(LogDev, "Zone: could not spawn the pawn");
     }
@@ -1635,6 +2089,100 @@ static void Zone_HandleStartingNewPlayerHook(UObject* GameMode, AActor* NewPlaye
 {
     Zone_HandleStartingNewPlayerOriginal(GameMode, NewPlayer);
     Zone_SetUpPlayer(GameMode, NewPlayer);
+}
+
+// A player's pawn after a death. The Zone game mode respawns a dead player by itself (RestartPlayerAtPlayerStart about a second after
+// PlayerDied), but everything Zone_SetUpPlayer does for the first pawn (AcknowledgedPawn, the default abilities, "finished loading", the
+// repeated ClientRestart, the hero with its skin and the pickaxe) was missing for that one, and the client sat on the respawn loading bar
+// (2026-11-07). When the game mode does not respawn the player within RespawnTimeoutSeconds, a pawn is spawned here like at the join.
+static void Zone_SetUpRespawnedPawn(AActor* Controller, AActor* Pawn)
+{
+    static auto AcknowledgedPawnOffset = Controller->GetOffset("AcknowledgedPawn", false);
+    if (AcknowledgedPawnOffset != -1) Controller->Get<AActor*>(AcknowledgedPawnOffset) = Pawn;
+
+    auto AbilityPlayerState = Cast<AFortPlayerState>(Controller->Get<UObject*>("PlayerState"));
+    auto AbilitySet = GetPlayerAbilitySet();
+    auto AbilitySystem = AbilityPlayerState ? AbilityPlayerState->GetAbilitySystemComponent() : nullptr;
+    if (AbilitySet && AbilitySystem) AbilitySet->GiveToAbilitySystem(AbilitySystem);
+
+    if (Fortnite_Version >= 7.3 && Fortnite_Version < 8.0)
+    {
+        if (auto SetHasFinishedLoading = (void (*)(UObject*, bool))ZoneFinder::SetHasFinishedLoading())
+            SetHasFinishedLoading(Controller, true);
+    }
+
+    // the restart loop in Zone_MaxTickRateHook sends ClientRestart again and re-runs the hero (skin, abilities, pickaxe)
+    gZoneRestartController = Controller;
+    gZoneRestartFrames = 0;
+    gZoneRestartsSent = 0;
+    gZoneHeroInitialized = false;
+
+    LOG_INFO(LogDev, "Zone: {} respawned as {}: possession, abilities and hero set up again", Controller->GetName(), Pawn->GetName());
+}
+
+static AActor* Zone_SpawnPlayerPawnAtStart(AActor* Controller)
+{
+    static auto PawnClass = LoadObject<UClass>(L"/Game/Abilities/Player/Pawns/PlayerPawn_Generic.PlayerPawn_Generic_C", FindObject<UClass>(L"/Script/CoreUObject.Class"));
+    if (!PawnClass) return nullptr;
+
+    FTransform Transform;
+    Transform.Rotation = FQuat(0, 0, 0, 1);
+    Transform.Scale3D = FVector(1, 1, 1);
+    Transform.Translation = Zone_StartLocationFor(Controller);
+
+    auto Pawn = GetWorld()->SpawnActor<AActor>(PawnClass, Transform);
+    if (Pawn) ((AController*)Controller)->Possess((APawn*)Pawn);
+    return Pawn;
+}
+
+static void Zone_WatchRespawn(AActor* Controller)
+{
+    constexpr double RespawnTimeoutSeconds = 10.0;
+    struct FWatch { std::string Name; AActor* Pawn = nullptr; std::chrono::steady_clock::time_point LostAt{}; bool bLost = false; };
+    static std::unordered_map<AActor*, FWatch> Watched;
+
+    for (auto It = Watched.begin(); It != Watched.end();)
+        It = (!It->first->IsValidLowLevel() || It->first->GetName() != It->second.Name) ? Watched.erase(It) : std::next(It);
+
+    static auto IsDeadFn = FindObject<UFunction>(L"/Script/FortniteGame.FortPawn.IsDead");
+    auto Pawn = Controller->Get<AActor*>("Pawn");
+    bool bDead = !Pawn;
+    if (Pawn && IsDeadFn) { bool bIsDead = false; Pawn->ProcessEvent(IsDeadFn, &bIsDead); bDead = bIsDead; }
+
+    auto Found = Watched.find(Controller);
+    if (Found == Watched.end())
+    {
+        // the first pawn is set up by Zone_SetUpPlayer
+        if (Pawn && !bDead) Watched[Controller] = { Controller->GetName(), Pawn };
+        return;
+    }
+
+    auto& Watch = Found->second;
+    const auto Now = std::chrono::steady_clock::now();
+
+    if (Pawn && !bDead && Pawn != Watch.Pawn)
+    {
+        Watch.Pawn = Pawn;
+        Watch.bLost = false;
+        Zone_SetUpRespawnedPawn(Controller, Pawn);
+        return;
+    }
+
+    if (bDead)
+    {
+        if (!Watch.bLost) { Watch.bLost = true; Watch.LostAt = Now; LOG_INFO(LogDev, "Zone: {} died, waiting for the respawn", Controller->GetName()); }
+        else if (std::chrono::duration<double>(Now - Watch.LostAt).count() > RespawnTimeoutSeconds && !Pawn)
+        {
+            if (auto NewPawn = Zone_SpawnPlayerPawnAtStart(Controller))
+            {
+                LOG_INFO(LogDev, "Zone: the game mode did not respawn {} within {:.0f}s, spawned a pawn", Controller->GetName(), RespawnTimeoutSeconds);
+                Watch.Pawn = NewPawn;
+                Watch.bLost = false;
+                Zone_SetUpRespawnedPawn(Controller, NewPawn);
+            }
+            else Watch.LostAt = Now;
+        }
+    }
 }
 
 // the hook above is not always called (the event can go through Blueprint), so the controllers are also looked for now and then
@@ -1649,7 +2197,12 @@ static void Zone_ScanPlayers()
     if (!GameMode || !ControllerClass) return;
 
     auto Controllers = UGameplayStatics::GetAllActorsOfClass(World, ControllerClass);
-    for (int i = 0; i < Controllers.Num(); ++i) Zone_SetUpPlayer(GameMode, Controllers.at(i));
+    for (int i = 0; i < Controllers.Num(); ++i)
+    {
+        auto Controller = Controllers.at(i);
+        Zone_SetUpPlayer(GameMode, Controller);
+        if (Controller && Controller != GetLocalPlayerController()) Zone_WatchRespawn(Controller);
+    }
     Controllers.Free();
 }
 
@@ -1707,6 +2260,28 @@ static float Zone_MaxTickRateHook()
 
     if (Globals::bZoneMode && Globals::bStartedListening) Zone_ScanPlayers();
 
+    // The outpost's deferred match start: once the outpost owner's quest config is there (its profile reached the server), or after 15 s so a
+    // player without an outpost quest still gets a match.
+    if (gZoneMatchStartPending && World)
+    {
+        static auto LibraryDefault = FindObject<UObject>(L"/Script/FortniteGame.Default__FortOutpostFunctionLibrary");
+        static auto GetConfigFn = FindObject<UFunction>(L"/Script/FortniteGame.FortOutpostFunctionLibrary.GetOutpostQuestMissionConfigData");
+        struct { UObject* WorldContextObject; FName ConfigTag; UObject* ReturnValue; } ConfigParams{ (UObject*)World, UKismetStringLibrary::Conv_StringToName(L"Quest.Metadata.Mission.Primary.Outpost"), nullptr };
+        if (LibraryDefault && GetConfigFn) LibraryDefault->ProcessEvent(GetConfigFn, &ConfigParams);
+
+        const double Waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - gZoneMatchStartRequestedAt).count();
+        if (ConfigParams.ReturnValue || Waited > 15.0)
+        {
+            gZoneMatchStartPending = false;
+            Zone_SpawnOutpostCoreEgg();  // before the mission looks for it
+            Zone_StartLoadedMissions(); // held back at load on the outpost, see Zone_ListenOnce
+            UObject* GameMode = ((UObject*)World)->Get<UObject*>("AuthorityGameMode");
+            static auto StartMatchFn = FindObject<UFunction>(L"/Script/Engine.GameMode.StartMatch");
+            if (GameMode && StartMatchFn) GameMode->ProcessEvent(StartMatchFn);
+            LOG_INFO(LogDev, "Zone: outpost match started after {:.1f}s ({})", Waited, ConfigParams.ReturnValue ? "quest config " + ConfigParams.ReturnValue->GetName() : std::string("no quest config, timed out"));
+        }
+    }
+
     // the restart controller belongs to a player who may have left since the last frame: forget it rather than call through it
     if (gZoneRestartController && !gZoneRestartController->IsValidLowLevel())
         gZoneRestartController = nullptr;
@@ -1720,10 +2295,10 @@ static float Zone_MaxTickRateHook()
         // AbilitySystemComponent and never re-runs GetOrInitializeHero (which ran too early when the player first joined). Call GetOrInitializeHero
         // now so PlayerState->HeroId & HeroType replicate to the client (initializing the client's ASC via BindToState), then re-grant default abilities
         // and re-equip the pickaxe so its weapon abilities are present on the freshly-initialized ASC.
-        // the 0x13efdf0 RVA is the 7.30.1 GetOrInitializeHero; held to 7.30 like the other hard-coded RVAs
-        if (!gZoneHeroInitialized && Fortnite_Version >= 7.3 && Fortnite_Version < 7.31)
+        // GetOrInitializeHero is found by signature (ZoneFinder.h)
+        auto GetOrInitializeHero = (UObject* (*)(UObject*))ZoneFinder::GetOrInitializeHero();
+        if (!gZoneHeroInitialized && GetOrInitializeHero)
         {
-            auto GetOrInitializeHero = (UObject* (*)(UObject*))(__int64(GetModuleHandleW(0)) + 0x13efdf0);
             if (auto Hero = GetOrInitializeHero(gZoneRestartController))
             {
                 gZoneHeroInitialized = true;
@@ -1762,7 +2337,20 @@ static float Zone_MaxTickRateHook()
                     static auto ItemDefinitionClass = FindObject<UClass>(L"/Script/FortniteGame.FortItemDefinition");
                     auto PickaxeDefinition = LoadObject<UFortItemDefinition>(L"/Game/Items/Weapons/Melee/Harvest/WID_Harvest_Pickaxe_C_T01.WID_Harvest_Pickaxe_C_T01", ItemDefinitionClass);
 
-                    if (PickaxeDefinition)
+                    // after a respawn the player still has the pickaxe from the first life: equip that one instead of adding a second
+                    if (Inventory && PickaxeDefinition)
+                    {
+                        if (auto Existing = Inventory->FindItemInstance(PickaxeDefinition))
+                        {
+                            if (auto ExistingEntry = Existing->GetItemEntry())
+                            {
+                                PickaxeDef = (UFortWeaponItemDefinition*)PickaxeDefinition;
+                                PickaxeGuid = ExistingEntry->GetItemGuid();
+                            }
+                        }
+                    }
+
+                    if (PickaxeDefinition && !PickaxeDef)
                     {
                         PickaxeDef = (UFortWeaponItemDefinition*)PickaxeDefinition;
 
@@ -2781,6 +3369,29 @@ DWORD WINAPI Main(LPVOID)
         UFortKismetLibrary::GetAIGoalManagerHook, (PVOID*)&UFortKismetLibrary::GetAIGoalManagerOriginal, false, true);
     Hooking::MinHook::Hook(FortKismetLibraryDefault, FindObject<UFunction>(L"/Script/FortniteGame.FortKismetLibrary.K2_GiveItemToPlayer"),
         UFortKismetLibrary::K2_GiveItemToPlayerHook, (PVOID*)&UFortKismetLibrary::K2_GiveItemToPlayerOriginal, false, true);
+    // tracing of the mission's encounter starts (does the mission script reach them, and what comes back)
+    if (auto MissionDefault = FindObject<UObject>(L"/Script/FortniteGame.Default__FortMission"))
+    {
+        Hooking::MinHook::Hook(MissionDefault, FindObject<UFunction>(L"/Script/FortniteGame.FortMission.StartMissionAIEncounterFromGeneratedProfile"),
+            Zone::StartEncounterTraceHook, (PVOID*)&Zone::StartEncounterTraceOriginal, false, true);
+    }
+
+    if (auto DecoToolDefault = FindObject<UObject>(L"/Script/FortniteGame.Default__FortDecoTool"))
+    {
+        Hooking::MinHook::Hook(DecoToolDefault, FindObject<UFunction>(L"/Script/FortniteGame.FortDecoTool.ServerSpawnDeco"),
+            Zone::ServerSpawnDecoHook, (PVOID*)&Zone::ServerSpawnDecoOriginal, false, true);
+    }
+
+    // Save the World mission item functions (the hooks pass through to the game's own outside the Zone)
+    Hooking::MinHook::Hook(FortKismetLibraryDefault, FindObject<UFunction>(L"/Script/FortniteGame.FortKismetLibrary.K2_GiveItemToAllPlayers"),
+        UFortKismetLibrary::K2_GiveItemToAllPlayersHook, (PVOID*)&UFortKismetLibrary::K2_GiveItemToAllPlayersOriginal, false, true);
+    Hooking::MinHook::Hook(FortKismetLibraryDefault, FindObject<UFunction>(L"/Script/FortniteGame.FortKismetLibrary.K2_RemoveItemFromAllPlayers"),
+        UFortKismetLibrary::K2_RemoveItemFromAllPlayersHook, (PVOID*)&UFortKismetLibrary::K2_RemoveItemFromAllPlayersOriginal, false, true);
+    Hooking::MinHook::Hook(FortKismetLibraryDefault, FindObject<UFunction>(L"/Script/FortniteGame.FortKismetLibrary.K2_GetItemQuantityOnPlayer"),
+        UFortKismetLibrary::K2_GetItemQuantityOnPlayerHook, (PVOID*)&UFortKismetLibrary::K2_GetItemQuantityOnPlayerOriginal, false, true);
+    if (auto MissionLibraryDefault = FindObject<UObject>(L"/Script/FortniteGame.Default__FortMissionLibrary"))
+        Hooking::MinHook::Hook(MissionLibraryDefault, FindObject<UFunction>(L"/Script/FortniteGame.FortMissionLibrary.SpawnAndCollectPlayerPickups"),
+            Zone::SpawnAndCollectPlayerPickupsHook, (PVOID*)&Zone::SpawnAndCollectPlayerPickupsOriginal, false, true);
     Hooking::MinHook::Hook(FortKismetLibraryDefault, FindObject<UFunction>(L"/Script/FortniteGame.FortKismetLibrary.K2_GiveBuildingResource"),
         UFortKismetLibrary::K2_GiveBuildingResourceHook, (PVOID*)&UFortKismetLibrary::K2_GiveBuildingResourceOriginal, false, true);
     Hooking::MinHook::Hook(FortKismetLibraryDefault, FindObject<UFunction>(L"/Script/FortniteGame.FortKismetLibrary.GiveItemToInventoryOwner"),

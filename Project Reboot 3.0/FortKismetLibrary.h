@@ -68,6 +68,9 @@ class UFortKismetLibrary : public UObject
 {
 public:
 	static inline void (*K2_GiveItemToPlayerOriginal)(UObject* Context, FFrame& Stack, void* Ret);
+	static inline void (*K2_GiveItemToAllPlayersOriginal)(UObject* Context, FFrame& Stack, void* Ret);
+	static inline void (*K2_RemoveItemFromAllPlayersOriginal)(UObject* Context, FFrame& Stack, void* Ret);
+	static inline void (*K2_GetItemQuantityOnPlayerOriginal)(UObject* Context, FFrame& Stack, void* Ret);
 	static inline void (*K2_RemoveItemFromPlayerOriginal)(UObject* Context, FFrame& Stack, void* Ret);
 	static inline void (*K2_RemoveItemFromPlayerByGuidOriginal)(UObject* Context, FFrame& Stack, void* Ret);
 	static inline void (*GiveItemToInventoryOwnerOriginal)(UObject* Context, FFrame& Stack, void* Ret);
@@ -97,6 +100,9 @@ public:
 	static void K2_RemoveItemFromPlayerHook(UObject* Context, FFrame& Stack, void* Ret);
 	static void K2_RemoveItemFromPlayerByGuidHook(UObject* Context, FFrame& Stack, void* Ret);
 	static void K2_GiveItemToPlayerHook(UObject* Context, FFrame& Stack, void* Ret);
+	static void K2_GiveItemToAllPlayersHook(UObject* Context, FFrame& Stack, void* Ret);
+	static void K2_RemoveItemFromAllPlayersHook(UObject* Context, FFrame& Stack, void* Ret);
+	static void K2_GetItemQuantityOnPlayerHook(UObject* Context, FFrame& Stack, void* Ret);
 	static void K2_GiveBuildingResourceHook(UObject* Context, FFrame& Stack, void* Ret);
 	static void K2_RemoveFortItemFromPlayerHook(UObject* Context, FFrame& Stack, void* Ret);
 	static AFortPickup* K2_SpawnPickupInWorldHook(UObject* Context, FFrame& Stack, AFortPickup** Ret);

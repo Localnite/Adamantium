@@ -1,5 +1,7 @@
 #include "FortLootPackage.h"
 
+#include <chrono>
+
 #include "DataTable.h"
 #include "KismetMathLibrary.h"
 #include "FortWeaponItemDefinition.h"
@@ -13,6 +15,26 @@ struct FFortGameFeatureLootTableData
     TSoftObjectPtr<UDataTable> LootTierData;
     TSoftObjectPtr<UDataTable> LootPackageData;
 };
+
+// ---- timing (see LogLootTimings) ----
+enum ELootTime { LootTime_Tables, LootTime_TierData, LootTime_Packages, LootTime_ItemLoad, LootTime_Total, LootTime_Num };
+static double gLootMs[LootTime_Num]{};
+static int gLootCalls[LootTime_Num]{};
+
+struct FLootTimer
+{
+    ELootTime Slot;
+    std::chrono::steady_clock::time_point Start = std::chrono::steady_clock::now();
+    FLootTimer(ELootTime InSlot) : Slot(InSlot) {}
+    ~FLootTimer() { gLootMs[Slot] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - Start).count(); gLootCalls[Slot]++; }
+};
+
+void LogLootTimings(const char* Label)
+{
+    LOG_INFO(LogLoot, "LootTime {}: total {:.0f} ms / {} calls, tables {:.0f} ms / {}, tier data {:.0f} ms / {}, packages {:.0f} ms / {}, item loads {:.0f} ms / {}", Label,
+        gLootMs[LootTime_Total], gLootCalls[LootTime_Total], gLootMs[LootTime_Tables], gLootCalls[LootTime_Tables], gLootMs[LootTime_TierData], gLootCalls[LootTime_TierData],
+        gLootMs[LootTime_Packages], gLootCalls[LootTime_Packages], gLootMs[LootTime_ItemLoad], gLootCalls[LootTime_ItemLoad]);
+}
 
 #define LOOTING_MAP_TYPE std::map // uhhh // TODO (Milxnor) switch bad to map
 
@@ -264,7 +286,16 @@ void PickLootDropsFromLootPackage(const std::vector<UDataTable*>& LPTables, cons
         return;
     }
 
-    auto ItemDefinition = PickedPackage->GetItemDefinition().Get(UFortItemDefinition::StaticClass(), true);
+    UFortItemDefinition* ItemDefinition = nullptr;
+
+    {
+        FLootTimer Timer(LootTime_ItemLoad);
+        // an in-memory lookup first: StaticLoadObject costs a lot even for an item that is already loaded (1.10)
+        ItemDefinition = PickedPackage->GetItemDefinition().Get(UFortItemDefinition::StaticClass(), false);
+
+        if (!ItemDefinition)
+            ItemDefinition = PickedPackage->GetItemDefinition().Get(UFortItemDefinition::StaticClass(), true);
+    }
 
     if (!ItemDefinition)
     {
@@ -372,6 +403,7 @@ void PickLootDropsFromLootPackage(const std::vector<UDataTable*>& LPTables, cons
 std::vector<LootDrop> PickLootDrops(FName TierGroupName, int WorldLevel, int ForcedLootTier, bool bPrint, int recursive, bool bCombineDrops)
 {
     std::vector<LootDrop> LootDrops;
+    FLootTimer TotalTimer(LootTime_Total);
 
     if (!TierGroupName.IsValid() 
         || Fortnite_Version >= 23 // RANDOMC RASH BRO???
@@ -634,6 +666,26 @@ std::vector<LootDrop> PickLootDrops(FName TierGroupName, int WorldLevel, int For
             // || Fortnite_Version >= 22
             )
         {
+            // These versions used to clear and reload both tables on every call ("the tables unload!"). StaticLoadObject is slow here
+            // (on 1.10 the floor loot took ~90 ms per spot, so 1146 spots kept the game thread busy past the backend's 45 s heartbeat
+            // timeout). Load them once per listen and root them so the garbage collector cannot unload them; reload only if one went bad.
+            static std::vector<UDataTable*> OldVersionLTDTables;
+            static std::vector<UDataTable*> OldVersionLPTables;
+            static int OldVersionTablesListen = -1;
+
+            bool bCachedTablesValid = OldVersionTablesListen == Globals::AmountOfListens && !OldVersionLTDTables.empty() && !OldVersionLPTables.empty();
+
+            for (auto Table : OldVersionLTDTables) bCachedTablesValid = bCachedTablesValid && Table && Table->IsValidLowLevel();
+            for (auto Table : OldVersionLPTables) bCachedTablesValid = bCachedTablesValid && Table && Table->IsValidLowLevel();
+
+            if (bCachedTablesValid)
+            {
+                LTDTables = OldVersionLTDTables;
+                LPTables = OldVersionLPTables;
+            }
+            else
+            {
+            FLootTimer Timer(LootTime_Tables);
             LTDTables.clear();
             LPTables.clear();
 
@@ -675,6 +727,16 @@ std::vector<LootDrop> PickLootDrops(FName TierGroupName, int WorldLevel, int For
                 LTDTables.push_back(LoadObject<UDataTable>(L"/Game/Items/Datatables/AthenaLootTierData_Client.AthenaLootTierData_Client"));
                 LPTables.push_back(LoadObject<UDataTable>(L"/Game/Items/Datatables/AthenaLootPackages_Client.AthenaLootPackages_Client"));
             }
+
+            for (auto Table : LTDTables) if (Table) Table->AddToRoot();
+            for (auto Table : LPTables) if (Table) Table->AddToRoot();
+
+            OldVersionLTDTables = LTDTables;
+            OldVersionLPTables = LPTables;
+            OldVersionTablesListen = Globals::AmountOfListens;
+
+            LOG_INFO(LogLoot, "Loaded and rooted the loot tables for this match ({} tier data, {} packages)", LTDTables.size(), LPTables.size());
+            }
         }
 
     }
@@ -686,7 +748,12 @@ std::vector<LootDrop> PickLootDrops(FName TierGroupName, int WorldLevel, int For
     }
 
     FName LootTierRowName;
-    auto ChosenRowLootTierData = PickLootTierData(LTDTables, TierGroupName, ForcedLootTier, &LootTierRowName);
+    FFortLootTierData* ChosenRowLootTierData = nullptr;
+
+    {
+        FLootTimer Timer(LootTime_TierData);
+        ChosenRowLootTierData = PickLootTierData(LTDTables, TierGroupName, ForcedLootTier, &LootTierRowName);
+    }
 
     if (!ChosenRowLootTierData)
     {
@@ -741,6 +808,7 @@ std::vector<LootDrop> PickLootDrops(FName TierGroupName, int WorldLevel, int For
 
                 int LootPackageCategory = i;
 
+                FLootTimer Timer(LootTime_Packages); // includes the item loads
                 PickLootDropsFromLootPackage(LPTables, ChosenRowLootTierData->GetLootPackage(), &LootDrops, LootPackageCategory, WorldLevel, bPrint);
             }
         }

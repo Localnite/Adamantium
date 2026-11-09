@@ -4,6 +4,9 @@
 #include "FortLootPackage.h"
 #include "AbilitySystemComponent.h"
 #include "FortGameModeAthena.h"
+#include "ZoneSearch.h"
+#include "GameplayStatics.h"
+#include "globals.h"
 
 UFortResourceItemDefinition* UFortKismetLibrary::K2_GetResourceItemDefinition(EFortResourceType ResourceType)
 {
@@ -413,6 +416,100 @@ void UFortKismetLibrary::K2_GiveItemToPlayerHook(UObject* Context, FFrame& Stack
 		PlayerController->GetWorldInventory()->Update();
 
 	return K2_GiveItemToPlayerOriginal(Context, Stack, Ret);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Save the World mission item functions. The missions hand the players their gear with these (the farmstead tutorial gives
+// the pistol, its ammo and the trap through K2_GiveItemToAllPlayers, takes the chest traps back with K2_RemoveItemFromAllPlayers
+// and polls K2_GetItemQuantityOnPlayer for the crafting and trap objectives). On this server build their native bodies leave the
+// inventory untouched, so none of it arrived (the trap placement step had no trap). Outside the Zone these stay the game's own.
+// A hooked native that does not call the original must consume the end-of-parameters token itself, the way P_FINISH does.
+
+static void FinishNativeParams(FFrame& Stack)
+{
+	if (Stack.Code)
+		Stack.Code++;
+}
+
+static std::vector<AFortPlayerController*> ZoneAllPlayerControllers()
+{
+	std::vector<AFortPlayerController*> Out;
+	auto Controllers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), AFortPlayerController::StaticClass());
+
+	for (int i = 0; i < Controllers.Num(); ++i)
+	{
+		if (auto Controller = Cast<AFortPlayerController>(Controllers.at(i)))
+			Out.push_back(Controller);
+	}
+
+	Controllers.Free();
+	return Out;
+}
+
+void UFortKismetLibrary::K2_GiveItemToAllPlayersHook(UObject* Context, FFrame& Stack, void* Ret)
+{
+	if (!Globals::bZoneMode)
+		return K2_GiveItemToAllPlayersOriginal(Context, Stack, Ret);
+
+	UObject* WorldContextObject = nullptr;
+	UFortItemDefinition* ItemDefinition = nullptr;
+	int NumberToGive = 0;
+	bool bNotifyPlayer = false;
+
+	Stack.StepCompiledIn(&WorldContextObject);
+	Stack.StepCompiledIn(&ItemDefinition);
+	Stack.StepCompiledIn(&NumberToGive);
+	Stack.StepCompiledIn(&bNotifyPlayer);
+	FinishNativeParams(Stack);
+
+	if (!ItemDefinition || NumberToGive <= 0)
+		return;
+
+	for (auto Controller : ZoneAllPlayerControllers())
+	{
+		Zone::GrantItemWithToast(Controller, ItemDefinition, NumberToGive, bNotifyPlayer);
+		LOG_INFO(LogDev, "Zone: mission gave {} x{} to {} (notify {})", ItemDefinition->GetPathName(), NumberToGive, Controller->GetName(), bNotifyPlayer);
+	}
+}
+
+void UFortKismetLibrary::K2_RemoveItemFromAllPlayersHook(UObject* Context, FFrame& Stack, void* Ret)
+{
+	if (!Globals::bZoneMode)
+		return K2_RemoveItemFromAllPlayersOriginal(Context, Stack, Ret);
+
+	UObject* WorldContextObject = nullptr;
+	UFortItemDefinition* ItemDefinition = nullptr;
+	int AmountToRemove = 0;
+
+	Stack.StepCompiledIn(&WorldContextObject);
+	Stack.StepCompiledIn(&ItemDefinition);
+	Stack.StepCompiledIn(&AmountToRemove);
+	FinishNativeParams(Stack);
+
+	if (!ItemDefinition || AmountToRemove <= 0)
+		return;
+
+	for (auto Controller : ZoneAllPlayerControllers())
+	{
+		int Removed = Zone::RemoveItemFromPlayer(Controller, ItemDefinition, AmountToRemove);
+		LOG_INFO(LogDev, "Zone: mission took {} x{} (asked {}) from {}", ItemDefinition->GetPathName(), Removed, AmountToRemove, Controller->GetName());
+	}
+}
+
+void UFortKismetLibrary::K2_GetItemQuantityOnPlayerHook(UObject* Context, FFrame& Stack, void* Ret)
+{
+	if (!Globals::bZoneMode)
+		return K2_GetItemQuantityOnPlayerOriginal(Context, Stack, Ret);
+
+	AFortPlayerController* PlayerController = nullptr;
+	UFortItemDefinition* ItemDefinition = nullptr;
+
+	Stack.StepCompiledIn(&PlayerController);
+	Stack.StepCompiledIn(&ItemDefinition);
+	FinishNativeParams(Stack);
+
+	if (Ret)
+		*(int*)Ret = Zone::CountItemOnPlayer(PlayerController, ItemDefinition);
 }
 
 void UFortKismetLibrary::K2_GiveBuildingResourceHook(UObject* Context, FFrame& Stack, void* Ret)

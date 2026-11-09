@@ -848,7 +848,12 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 
 		LOG_INFO(LogNet, "Attempting to listen!");
 
-		GetWorld()->Listen();
+		// With a Zone map set the server travels there right after this start, and the old world's beacon and net driver would keep
+		// ports 7776/7777 for good (nothing closes them on travel), pushing the Zone world's listener to 7778. Only the Zone world listens then.
+		if (RebootConfig::Get().Stw.Map.empty())
+			GetWorld()->Listen();
+		else
+			LOG_INFO(LogNet, "Not listening in the island world: {} is next", RebootConfig::Get().Stw.Map);
 
 		static auto WarmupRequiredPlayerCountOffset = GameMode->GetOffset("WarmupRequiredPlayerCount");
 		GameMode->Get<int>(WarmupRequiredPlayerCountOffset) = WarmupRequiredPlayerCount;
@@ -1039,12 +1044,16 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 
 		UptimeWebHook.send_message(std::format("Server up! {} {}", Fortnite_Version, PlaylistName)); // PlaylistName sometimes isn't always what we use!
 
-		static auto ReplicationDriverOffset = GetWorld()->GetNetDriver()->GetOffset("ReplicationDriver", false); // If netdriver is null the world blows up
+		// If netdriver is null the world blows up: a Zone start has none here, Zone_ListenOnce sets the flag from its own driver
+		if (GetWorld()->GetNetDriver())
+		{
+			static auto ReplicationDriverOffset = GetWorld()->GetNetDriver()->GetOffset("ReplicationDriver", false);
 
-		Globals::bShouldUseReplicationGraph = (!(ReplicationDriverOffset == -1 || Fortnite_Version >= 20))
-			&& Fortnite_Version != 3.3; // RepGraph is half implemented
+			Globals::bShouldUseReplicationGraph = (!(ReplicationDriverOffset == -1 || Fortnite_Version >= 20))
+				&& Fortnite_Version != 3.3; // RepGraph is half implemented
 
-		LOG_INFO(LogDev, "bShouldUseReplicationGraph: {}", Globals::bShouldUseReplicationGraph);
+			LOG_INFO(LogDev, "bShouldUseReplicationGraph: {}", Globals::bShouldUseReplicationGraph);
+		}
 
 		Globals::bStartedListening = true;
 	}
@@ -1449,6 +1458,7 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 			for (int i = 0; i < SpawnIsland_FloorLoot_Actors.Num(); ++i)
 			{
 				ABuildingContainer* CurrentActor = (ABuildingContainer*)SpawnIsland_FloorLoot_Actors.at(i);
+				BOT_CRUMB("FloorLoot:warmup", i); // which spot, if the loot code hangs (HANGLOG)
 				auto Location = CurrentActor->GetActorLocation() + CurrentActor->GetActorForwardVector() * CurrentActor->GetLootSpawnLocation_Athena().X + CurrentActor->GetActorRightVector() * CurrentActor->GetLootSpawnLocation_Athena().Y + CurrentActor->GetActorUpVector() * CurrentActor->GetLootSpawnLocation_Athena().Z;
 
 				std::vector<LootDrop> LootDrops = PickLootDrops(SpawnIslandTierGroup, GameState->GetWorldLevel(), -1, bPrintWarmup);
@@ -1477,6 +1487,10 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 			for (int i = 0; i < BRIsland_FloorLoot_Actors.Num(); ++i)
 			{
 				ABuildingContainer* CurrentActor = (ABuildingContainer*)BRIsland_FloorLoot_Actors.at(i);
+				BOT_CRUMB("FloorLoot:island-pick", i);
+
+				if (i % 100 == 0)
+					LogLootTimings(std::format("island spot {}", i).c_str());
 				spawned++;
 
 				// LOG_INFO(LogDev, "Test: {}", CurrentActor->GetSearchLootTierGroup().ToString());
@@ -1484,6 +1498,8 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 				auto Location = CurrentActor->GetActorLocation() + CurrentActor->GetActorForwardVector() * CurrentActor->GetLootSpawnLocation_Athena().X + CurrentActor->GetActorRightVector() * CurrentActor->GetLootSpawnLocation_Athena().Y + CurrentActor->GetActorUpVector() * CurrentActor->GetLootSpawnLocation_Athena().Z;
 
 				std::vector<LootDrop> LootDrops = PickLootDrops(BRIslandTierGroup, GameState->GetWorldLevel(), -1, bPrintIsland);
+
+				BOT_CRUMB("FloorLoot:island-spawn", i); // past picking (PickLootDrops), now spawning the pickups
 
 				for (auto& LootDrop : LootDrops)
 				{
@@ -1501,6 +1517,8 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 				if (!bDestroyFloorLootActor)
 					CurrentActor->K2_DestroyActor();
 			}
+
+			LogLootTimings("floor loot done");
 
 			SpawnIsland_FloorLoot_Actors.Free();
 			BRIsland_FloorLoot_Actors.Free();

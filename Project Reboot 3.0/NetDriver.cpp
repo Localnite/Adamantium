@@ -6,6 +6,8 @@
 #include "FortPlayerControllerAthena.h"
 #include "GameplayStatics.h"
 #include "ZoneHusks.h"
+#include "ZoneSearch.h"
+#include "ZoneMatchmaking.h"
 #include "KismetMathLibrary.h"
 #include <random>
 #include "Package.h"
@@ -13,6 +15,7 @@
 #include "bots.h"
 #include "gui.h"
 #include "prodmatch.h"
+#include "ZoneFinder.h"
 
 enum class EChannelCloseReason : uint8
 {
@@ -44,6 +47,8 @@ void UNetDriver::RemoveNetworkActor(AActor* Actor)
 
 void UNetDriver::TickFlushHook(UNetDriver* NetDriver)
 {
+	HangWatchdogTick();
+
 	if (bShouldDestroyAllPlayerBuilds) // i hate this
 	{
 		auto AllBuildingSMActors = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ABuildingSMActor::StaticClass());
@@ -70,6 +75,8 @@ void UNetDriver::TickFlushHook(UNetDriver* NetDriver)
 	if (Globals::bZoneMode)
 	{
 		Zone::HusksTick();
+		Zone::SearchTick();
+		Zone::MatchmakingTick();
 	}
 
 	if (bEnableBotTick && !Globals::bZoneMode && RebootConfig::Get().Bots.bEnabled)
@@ -419,6 +426,43 @@ static UActorChannel* FindChannel(AActor* Actor, UNetConnection* Connection)
 	// LOG_INFO(LogDev, "Failed to find channel for {}!", Actor->GetName());
 
 	return nullptr;
+}
+
+// For the Zone's reservation/lobby beacon (ZoneMatchmaking.cpp): replicate one actor to one beacon connection through its own actor channel,
+// opening the channel if there is none. The beacon driver has no replication graph, and running all of ServerReplicateActors on it crashed
+// the server in the engine's TickFlush (Build157), so only the few actors the lobby needs go out, the same way the beacon host itself opens
+// the channel for a beacon client actor.
+bool ZoneReplicateBeaconActor(AActor* Actor, UNetConnection* Connection)
+{
+	if (!Actor || !Connection)
+		return false;
+
+	// Reboot's pattern scans find none of these on 7.30 (all logged as the module base, i.e. 0; the replication graph never needed them), so
+	// ZoneFinder's 7.30 signatures stand in: CreateChannelByName and SetChannelActor are the pair every SetChannelActor caller makes
+	// (CreateChannelByName(Connection, &NAME_Actor, OpenedLocally, -1)); SetChannelActor logs "SetChannelActor: ChIndex: %i, Actor: %s";
+	// ReplicateActor's "ReplicateActor called while already replicating" string is in its next .pdata chunk, so it is found by its start.
+	static UObject* (*CreateChannelByName)(UNetConnection* Connection, const FName& ChName, EChannelCreateFlags CreateFlags, int32_t ChannelIndex) =
+		decltype(CreateChannelByName)(Addresses::CreateChannel ? Addresses::CreateChannel : ZoneFinder::CreateChannelByName());
+	static __int64 (*SetChannelActor)(UActorChannel*, AActor*) = decltype(SetChannelActor)(Addresses::SetChannelActor ? Addresses::SetChannelActor : ZoneFinder::SetChannelActor());
+	static __int64 (*ReplicateActor)(UActorChannel*) = decltype(ReplicateActor)(Addresses::ReplicateActor ? Addresses::ReplicateActor : ZoneFinder::ReplicateActor());
+	if (!CreateChannelByName || !SetChannelActor || !ReplicateActor)
+		return false;
+	static FName ActorName = UKismetStringLibrary::Conv_StringToName(L"Actor");
+
+	auto Channel = FindChannel(Actor, Connection);
+
+	if (!Channel)
+	{
+		Channel = (UActorChannel*)CreateChannelByName(Connection, ActorName, EChannelCreateFlags::OpenedLocally, -1);
+
+		if (!Channel)
+			return false;
+
+		SetChannelActor(Channel, Actor);
+	}
+
+	ReplicateActor(Channel);
+	return true;
 }
 
 static bool IsActorRelevantToConnection(AActor* Actor, std::vector<FNetViewer>&ConnectionViewers)

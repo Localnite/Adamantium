@@ -256,3 +256,6 @@ FORCEINLINE static ValueType PickWeightedElement(const std::unordered_map<KeyTyp
 }
 
 std::vector<LootDrop> PickLootDrops(FName TierGroupName, int WorldLevel, int ForcedLootTier = -1, bool bPrint = false, int recursive = 0, bool bCombineDrops = true);
+
+// where PickLootDrops spends its time (floor loot on 1.10 took ~90 ms per spot, so 1073 spots outlived the backend's heartbeat timeout)
+void LogLootTimings(const char* Label);

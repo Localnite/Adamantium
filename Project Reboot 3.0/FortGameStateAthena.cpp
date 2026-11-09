@@ -158,7 +158,17 @@ UFortPlaylistAthena*& AFortGameStateAthena::GetCurrentPlaylist()
 
 	if (CurrentPlaylistInfoOffset == -1)
 	{
-		static auto CurrentPlaylistDataOffset = GetOffset("CurrentPlaylistData");
+		static auto CurrentPlaylistDataOffset = GetOffset("CurrentPlaylistData", false);
+
+		// very old builds (1.10) have neither property: reading at offset -1 gave a garbage pointer that crashed the first caller
+		// (the bot team code on a player's join). No playlist there; callers already handle null.
+		if (CurrentPlaylistDataOffset == -1)
+		{
+			static UFortPlaylistAthena* NoPlaylist = nullptr;
+			NoPlaylist = nullptr;
+			return NoPlaylist;
+		}
+
 		return (Get<UFortPlaylistAthena*>(CurrentPlaylistDataOffset));
 	}
 

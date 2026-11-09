@@ -1,5 +1,7 @@
 #include "BotRegistry.h"
 #include "FortPickup.h"
+#include "globals.h"
+#include "ZoneSearch.h"
 
 #include "FortPawn.h"
 #include "FortItemDefinition.h"
@@ -335,6 +337,14 @@ char AFortPickup::CompletePickupAnimationHook(AFortPickup* Pickup)
 	if (auto GameModePickup = Cast<AFortGameModePickup>(Pickup))
 	{
 		LOG_INFO(LogDev, "GameModePickup!");
+		return CompletePickupAnimationOriginal(Pickup);
+	}
+
+	// Save the World: the end of the pickup animation grants the item the STW way (stacking, toast, quickbar). The Athena slot
+	// logic below (five primary slots, swap, overflow drop) counts crafting ingredients as weapons and would drop them back out.
+	if (Globals::bZoneMode)
+	{
+		Zone::GrantItemWithToast(PlayerController, PickupItemDefinition, IncomingCount);
 		return CompletePickupAnimationOriginal(Pickup);
 	}
 

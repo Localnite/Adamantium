@@ -4,6 +4,7 @@
 #include "Actor.h"
 
 #include "reboot.h"
+#include "ZoneMatchmaking.h"
 
 AWorldSettings* UWorld::K2_GetWorldSettings()
 {
@@ -94,7 +95,10 @@ void UWorld::Listen()
 		NewNetDriver->GetMaxClientRate() = NewNetDriver->GetMaxInternetClientRate();
 	}
 
-	LOG_INFO(LogNet, "Listening on port {}!", Port + Globals::AmountOfListens - 1);
+	// InitListen writes the port it really bound back into the URL: when the asked one is taken (a leaked socket of a crashed server in
+	// the shared Wine prefix keeps it) the driver takes the next free one, and the Zone matchmaker must advertise that one
+	Zone::SetGamePort(URL.Port);
+	LOG_INFO(LogNet, "Listening on port {}!", URL.Port);
 }
 
 AWorldSettings* UWorld::GetWorldSettings(const bool bCheckStreamingPersistent, const bool bChecked) const

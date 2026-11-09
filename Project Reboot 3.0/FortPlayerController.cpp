@@ -355,6 +355,31 @@ void AFortPlayerController::ServerExecuteInventoryItemHook(AFortPlayerController
 			{
 				Pawn->GetCurrentWeapon()->GetItemEntryGuid() = ItemGuid;
 
+				// Save the World traps: the client's trap tool asks ServerSpawnDeco, whose server code answers nothing at all while the
+				// tool's ItemDefinition is unset (the equip above does not set it). Without it the trap never exists on the server: the
+				// item is never used up and the mission never hears the trap was built.
+				{
+					static auto DecoToolClass = FindObject<UClass>(L"/Script/FortniteGame.FortDecoTool");
+					auto Tool = Pawn->GetCurrentWeapon();
+
+					if (Tool && DecoToolClass && Tool->IsA(DecoToolClass))
+					{
+						static auto ToolDefinitionOffset = Tool->GetOffset("ItemDefinition", false);
+
+						if (ToolDefinitionOffset != -1)
+						{
+							Tool->Get<UObject*>(ToolDefinitionOffset) = DecoItemDefinition;
+
+							static auto OnRep_ItemDefinitionFn = FindObject<UFunction>(L"/Script/FortniteGame.FortDecoTool.OnRep_ItemDefinition");
+							if (OnRep_ItemDefinitionFn)
+								Tool->ProcessEvent(OnRep_ItemDefinitionFn);
+
+							if (Globals::bZoneMode)
+								LOG_INFO(LogDev, "Zone: equipped deco tool {} for {}", Tool->GetName(), DecoItemDefinition->GetName());
+						}
+					}
+				}
+
 				static auto FortDecoTool_ContextTrapStaticClass = FindObject<UClass>(L"/Script/FortniteGame.FortDecoTool_ContextTrap");
 
 				if (Pawn->GetCurrentWeapon()->IsA(FortDecoTool_ContextTrapStaticClass))
@@ -876,6 +901,68 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
 
 	auto PlayerStateAthena = Cast<AFortPlayerStateAthena, false>(PlayerController->GetPlayerState());
+
+	if (!PlayerStateAthena && Globals::bZoneMode && Fortnite_Version < 8.30)
+	{
+		// Save the World: the exe's own ServerCreateBuildingActor places the piece but never takes the materials (the paying
+		// half is server code compiled out of this client exe), so building was free. Every tier-1 piece costs 10 of its
+		// material in STW, as in BR. Refuse the build when the player can't pay, otherwise let the game build it and charge
+		// only if a piece of that class now stands at that spot (the game can still refuse it: overlap, no support ...).
+		struct FBuildingClassData { UClass* BuildingClass; int PreviousBuildingLevel; int UpgradeLevel; };
+		struct SCBAParams { FBuildingClassData BuildingClassData; FVector BuildLoc; FRotator BuildRot; bool bMirrored; };
+		auto Params = *(SCBAParams*)Stack->Locals; // copied: the original consumes the frame
+
+		auto BuildingDefault = Params.BuildingClassData.BuildingClass ? (ABuildingSMActor*)Params.BuildingClassData.BuildingClass->CreateDefaultObject() : nullptr;
+		auto MatDefinition = BuildingDefault ? UFortKismetLibrary::K2_GetResourceItemDefinition(BuildingDefault->GetResourceType()) : nullptr;
+
+		if (!MatDefinition || PlayerController->DoesBuildFree())
+			return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
+
+		constexpr int MaterialCost = 10;
+		int Have = Zone::CountItemOnPlayer(PlayerController, (UFortItemDefinition*)MatDefinition);
+
+		if (Have < MaterialCost)
+		{
+			LOG_INFO(LogDev, "Zone build: refused {}, {} {} of {}", Params.BuildingClassData.BuildingClass->GetName(), MatDefinition->GetName(), Have, MaterialCost);
+			return; // the RPC is consumed without building, like the real server does when you are out of materials
+		}
+
+		static __int64 (*CantBuild)(UObject*, UObject*, FVector, FRotator, char, TArray<ABuildingSMActor*>*, char*) = decltype(CantBuild)(Addresses::CantBuild);
+
+		// whether a piece of this class stands exactly here (the one the game just built)
+		auto PieceStandsHere = [&]() -> bool
+		{
+			TArray<ABuildingSMActor*> Existing;
+			char Unused;
+			CantBuild(GetWorld(), Params.BuildingClassData.BuildingClass, Params.BuildLoc, Params.BuildRot, Params.bMirrored, &Existing, &Unused);
+			bool bFound = false;
+
+			for (int i = 0; i < Existing.Num(); ++i)
+			{
+				auto Piece = Existing.at(i);
+
+				if (Piece && Piece->ClassPrivate == Params.BuildingClassData.BuildingClass && (Piece->GetActorLocation() - Params.BuildLoc).SizeSquared() < 50.0f * 50.0f)
+					bFound = true;
+			}
+
+			Existing.Free();
+			return bFound;
+		};
+
+		bool bWasThere = PieceStandsHere();
+		ServerCreateBuildingActorOriginal(Context, Stack, Ret);
+		bool bBuilt = !bWasThere && PieceStandsHere();
+
+		if (bBuilt)
+		{
+			int Removed = Zone::RemoveItemFromPlayer(PlayerController, (UFortItemDefinition*)MatDefinition, MaterialCost);
+			LOG_INFO(LogDev, "Zone build: {} cost {} {} ({} left)", Params.BuildingClassData.BuildingClass->GetName(), Removed, MatDefinition->GetName(), Have - Removed);
+		}
+		else
+			LOG_INFO(LogDev, "Zone build: game did not place {} (no charge)", Params.BuildingClassData.BuildingClass->GetName());
+
+		return;
+	}
 
 	if (!PlayerStateAthena)
 		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
@@ -1732,8 +1819,31 @@ void AFortPlayerController::ServerBeginEditingBuildingActorHook(AFortPlayerContr
 {
 	DEBUG_LOG_INFO(LogDev, "\n[Begin START]!");
 
-	if (!BuildingActorToEdit || !BuildingActorToEdit->IsPlayerPlaced()) // We need more checks.
+	if (!BuildingActorToEdit)
 		return;
+
+	if (!BuildingActorToEdit->IsPlayerPlaced()) // We need more checks.
+	{
+		// Save the World missions place building pieces in the level that the player is meant to edit (the tutorial's wall in front of the rocket launcher).
+		// They are not player placed, so only the build-piece classes get through; props and house walls are other classes and stay out.
+		bool bLevelPlacedPiece = false;
+
+		if (Globals::bZoneMode)
+		{
+			static const wchar_t* PieceClasses[] = { L"/Script/FortniteGame.BuildingWall", L"/Script/FortniteGame.BuildingFloor", L"/Script/FortniteGame.BuildingStairs", L"/Script/FortniteGame.BuildingRoof" };
+
+			for (auto ClassPath : PieceClasses)
+			{
+				auto PieceClass = FindObject<UClass>(ClassPath);
+				bLevelPlacedPiece |= PieceClass && BuildingActorToEdit->IsA(PieceClass);
+			}
+
+			LOG_INFO(LogDev, "Zone: edit requested on level-placed {} (build piece: {})", BuildingActorToEdit->GetFullName(), bLevelPlacedPiece);
+		}
+
+		if (!bLevelPlacedPiece)
+			return;
+	}
 
 	auto Pawn = PlayerController->GetMyFortPawn();
 

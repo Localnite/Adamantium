@@ -39,11 +39,19 @@ namespace RebootConfig
 		std::string Map;            // Zone map the server opens at start instead of the Battle Royale island, e.g. Zone_Onboarding_FarmsteadFort (empty = Athena_Terrain)
 		std::string GameMode = "/Game/Blueprints/GameModeZone.GameModeZone_C";
 		std::string Options;        // more URL options for that map, without the leading ?, e.g. worldId=...?theaterId=...
+		std::string ZoneTheme;      // the zone theme class put into the new world record, e.g. /Game/World/ZoneThemes/Outposts/BP_ZT_TheOutpost_PvE_01.BP_ZT_TheOutpost_PvE_01_C (not a URL option: zoneThemeClass in the URL makes the Zone ask the backend for the theater, a request this server has no permission to send)
+		std::string Mission;        // the primary FortMissionInfo the Zone loads, e.g. /Game/Missions/Primary/Outpost/MissionInfo_Outpost_PvE_01.MissionInfo_Outpost_PvE_01 (empty = the tutorial's on the tutorial map, none elsewhere)
 		int ListenDelayFrames = 150; // frames after a Zone map is up before the server starts listening
 		int TravelDelayFrames = 400; // frames after the island is up before the server travels to Map
 		bool bMcp = true;           // fetch the players' profiles from the backend as dedicated server commands (needed for STW)
-		bool bSpawnHusks = false;   // spawn HuskPawn_C manually on player join (off by default so server doesn't crash on join; encounters handle native husks)
+		bool bHuskFallback = true;  // when the game's own encounter spawns no husk after the husk objective starts, place the tutorial husks by hand
+		int HuskFallbackSeconds = 20; // how long to wait for the game's own husks before the fallback spawn
 		std::string Replication = "graph"; // how the Zone world replicates: graph = the replication graph is switched on and Reboot drives it, native = the game's own setting and the engine replicates (Reboot does not), reboot = Reboot's own port of ServerReplicateActors without the graph
+		bool bMatchmaking = true;   // open the party reservation beacon and register this Zone server with the backend, so the game's own matchmaking finds it (ZoneMatchmaking.cpp)
+		int GamePort = 7777;        // the port the Zone world listens on, as told to the backend (players connect to it after the reservation)
+		int BeaconPort = 15000;     // the party reservation beacon (the client reserves here before it connects)
+		int MaxPlayers = 4;         // one party per mission
+		std::string Backend = "http://127.0.0.1:5000"; // the backend this server registers with (LawinServerV2)
 	};
 
 	struct Config
@@ -86,12 +94,22 @@ namespace RebootConfig
 			"GameMode=/Game/Blueprints/GameModeZone.GameModeZone_C\r\n"
 			"; more URL options for the map, without the leading ?  (worldId=...?theaterId=...?theaterMissionId=...?zoneThemeClass=...)\r\n"
 			"Options=\r\n"
+			"; the primary mission (FortMissionInfo path) the Zone loads; empty = the tutorial's on the tutorial map\r\n"
+			"Mission=\r\n"
+			"; the zone theme class (BP_ZT_..._C path) put into the new world record; it brings the mission's player spawn pad\r\n"
+			"ZoneTheme=\r\n"
 			"; frames after the Zone map is up before the server listens\r\n"
 			"ListenDelayFrames=150\r\n"
 			"; frames after the island is up before the server travels to Map\r\n"
 			"TravelDelayFrames=400\r\n"
 			"; fetch the players' profiles from the backend as dedicated server commands\r\n"
-			"Mcp=true\r\n";
+			"Mcp=true\r\n"
+			"; open the party reservation beacon and register with the backend, so the game's matchmaking finds this Zone server\r\n"
+			"Matchmaking=true\r\n"
+			"GamePort=7777\r\n"
+			"BeaconPort=15000\r\n"
+			"MaxPlayers=4\r\n"
+			"Backend=http://127.0.0.1:5000\r\n";
 	}
 
 	inline std::wstring Widen(const std::string& In) { return std::wstring(In.begin(), In.end()); }
@@ -211,12 +229,20 @@ namespace RebootConfig
 		Out.Stw.Map = Text(L"SaveTheWorld", L"Map", "");
 		Out.Stw.GameMode = Text(L"SaveTheWorld", L"GameMode", Out.Stw.GameMode);
 		Out.Stw.Options = Text(L"SaveTheWorld", L"Options", "");
+		Out.Stw.Mission = Text(L"SaveTheWorld", L"Mission", "");
+		Out.Stw.ZoneTheme = Text(L"SaveTheWorld", L"ZoneTheme", "");
 		Out.Stw.ListenDelayFrames = (std::max)(1, (int)Number(L"SaveTheWorld", L"ListenDelayFrames", Out.Stw.ListenDelayFrames));
 		Out.Stw.TravelDelayFrames = (std::max)(1, (int)Number(L"SaveTheWorld", L"TravelDelayFrames", Out.Stw.TravelDelayFrames));
 		Out.Stw.bMcp = Flag(L"SaveTheWorld", L"Mcp", Out.Stw.bMcp);
-		Out.Stw.bSpawnHusks = Flag(L"SaveTheWorld", L"SpawnHusks", Out.Stw.bSpawnHusks);
+		Out.Stw.bHuskFallback = Flag(L"SaveTheWorld", L"HuskFallback", Out.Stw.bHuskFallback);
+		Out.Stw.HuskFallbackSeconds = (std::max)(1, (int)Number(L"SaveTheWorld", L"HuskFallbackSeconds", Out.Stw.HuskFallbackSeconds));
 		Out.Stw.Replication = Text(L"SaveTheWorld", L"Replication", Out.Stw.Replication);
 		for (auto& Letter : Out.Stw.Replication) Letter = (char)tolower(Letter);
+		Out.Stw.bMatchmaking = Flag(L"SaveTheWorld", L"Matchmaking", Out.Stw.bMatchmaking);
+		Out.Stw.GamePort = (int)Number(L"SaveTheWorld", L"GamePort", Out.Stw.GamePort);
+		Out.Stw.BeaconPort = (int)Number(L"SaveTheWorld", L"BeaconPort", Out.Stw.BeaconPort);
+		Out.Stw.MaxPlayers = (std::max)(1, (int)Number(L"SaveTheWorld", L"MaxPlayers", Out.Stw.MaxPlayers));
+		Out.Stw.Backend = Text(L"SaveTheWorld", L"Backend", Out.Stw.Backend);
 
 		Out.bLoaded = true;
 		return Out;

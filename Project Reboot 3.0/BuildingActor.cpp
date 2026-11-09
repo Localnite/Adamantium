@@ -169,11 +169,11 @@ void ABuildingActor::OnDamageServerHook(ABuildingActor* BuildingActor, float Dam
 				continue;
 			}
 
-			bool bShouldUpdate = false;
-			WorldInventory->AddItem(ItemDef, &bShouldUpdate, Count);
-
-			if (bShouldUpdate || bFinalBlow)
-				WorldInventory->Update();
+			// grant through the toast helper so the client shows the STW pickup feed
+			// ("x2 [Crafting Item] Twine") and the item counts toward the mission's
+			// K2_GetItemQuantityOnPlayer checks once it lands (they poll, so the 0-frame
+			// delay of a direct grant does not matter)
+			Zone::GrantItemWithToast(ZoneController, ItemDef, Count);
 
 			bGrantedAny = true;
 		}

@@ -18,6 +18,13 @@ struct FUniqueNetIdRepl // : public FUniqueNetIdWrapper
 		return Size;
 	}
 
+	// 1.10's UniqueNetIdRepl has no ReplicationBytes: the offset is then -1 and GetReplicationBytes points at garbage
+	static bool HasReplicationBytes()
+	{
+		static auto ReplicationBytesOffset = FindOffsetStruct("/Script/Engine.UniqueNetIdRepl", "ReplicationBytes", false);
+		return ReplicationBytesOffset != -1;
+	}
+
 	TArray<uint8>& GetReplicationBytes()
 	{
 		static auto ReplicationBytesOffset = FindOffsetStruct("/Script/Engine.UniqueNetIdRepl", "ReplicationBytes");
