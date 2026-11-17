@@ -1,4 +1,5 @@
 #include "FortPawn.h"
+#include "questStats.h"
 
 #include "reboot.h"
 #include "FortPlayerControllerAthena.h"
@@ -102,12 +103,75 @@ void AFortPawn::SetMaxShield(float NewShieldVal)
 		this->ProcessEvent(SetMaxShieldFn, &NewShieldVal);
 }
 
+// Challenge progress: damage a real player deals to another player. The server multicasts the hit from the shooter's pawn (the same
+// cue the bots send, see BotBrain::SendShotCue): bIsCritical is a headshot, Magnitude the damage, HitActor who was hit. Reported as a
+// "Damage" fact with the source tags the game's objective rows look for (Homebase.Class = a player, Gameplay.Damage.Critical = a
+// headshot, plus the weapon's own item tags, e.g. Weapon.Melee.Impact.Pickaxe), see questStats.h.
+static void ReportDamageForChallenges(AFortPawn* Pawn, AFortPlayerController* Controller, AFortWeapon* Weapon, FFrame* Stack)
+{
+	static const char* FnPath = "/Script/FortniteGame.FortPawn.NetMulticast_Athena_BatchedDamageCues";
+	static const char* Shared = "/Script/FortniteGame.AthenaBatchedDamageGameplayCues_Shared";
+	static const char* NonShared = "/Script/FortniteGame.AthenaBatchedDamageGameplayCues_NonShared";
+	static int SharedOffset = FindOffsetStruct(FnPath, "SharedData", false);
+	static int NonSharedOffset = FindOffsetStruct(FnPath, "NonSharedData", false);
+	static int HitActorOffset = FindOffsetStruct(NonShared, "HitActor", false);
+	static int MagnitudeOffset = FindOffsetStruct(Shared, "Magnitude", false);
+	static int ValidOffset = FindOffsetStruct(Shared, "bIsValid", false);
+	static int CriticalOffset = FindOffsetStruct(Shared, "bIsCritical", false);
+	static auto ValidProp = FindPropertyStruct(Shared, "bIsValid", false);
+	static auto CriticalProp = FindPropertyStruct(Shared, "bIsCritical", false);
+	static auto PlayerPawnClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerPawnAthena");
+
+	if (Globals::bZoneMode || !Controller || !Stack || !Stack->Locals || SharedOffset == -1 || NonSharedOffset == -1 || HitActorOffset == -1 || MagnitudeOffset == -1 || CriticalOffset == -1)
+		return;
+
+	auto ReadBool = [](uint8_t* Base, int Offset, void* Prop)
+	{
+		const uint8_t Mask = Prop ? GetFieldMask(Prop) : 0;
+		const uint8_t Byte = *(Base + Offset);
+		return (Mask == 0 || Mask == 0xFF) ? Byte != 0 : (Byte & Mask) != 0;
+	};
+
+	uint8_t* S = (uint8_t*)Stack->Locals + SharedOffset;
+	uint8_t* N = (uint8_t*)Stack->Locals + NonSharedOffset;
+	auto HitActor = *(UObject**)(N + HitActorOffset);
+	const float Magnitude = *(float*)(S + MagnitudeOffset);
+
+	if ((ValidOffset != -1 && !ReadBool(S, ValidOffset, ValidProp)) || !HitActor || HitActor == Pawn || Magnitude <= 0.0f || !PlayerPawnClass || !HitActor->IsA(PlayerPawnClass))
+		return;
+
+	QuestStats::Fact Fact;
+	Fact.AccountId = QuestStats::AccountIdOf(Controller->GetPlayerState());
+	Fact.Type = "Damage";
+	Fact.Amount = Magnitude;
+	Fact.Target = { "Athena.Player" };
+	Fact.Source = { "Homebase.Class" };
+
+	if (ReadBool(S, CriticalOffset, CriticalProp))
+		Fact.Source.push_back("Gameplay.Damage.Critical");
+
+	if (auto Definition = Weapon ? (UObject*)Weapon->GetWeaponData() : nullptr)
+	{
+		static int ItemTagsOffset = Definition->GetOffset("GameplayTags", false);
+
+		if (ItemTagsOffset != -1)
+		{
+			for (auto& Tag : QuestStats::TagsOf(Definition->GetPtr<FGameplayTagContainer>(ItemTagsOffset)))
+				Fact.Source.push_back(Tag);
+		}
+	}
+
+	QuestStats::Queue(std::move(Fact));
+}
+
 void AFortPawn::NetMulticast_Athena_BatchedDamageCuesHook(UObject* Context, FFrame* Stack, void* Ret)
 {
 	auto Pawn = (AFortPawn*)Context;
 	auto Controller = Cast<AFortPlayerController>(Pawn->GetController());
 	auto CurrentWeapon = Pawn->GetCurrentWeapon();
 	auto WorldInventory = Controller ? Controller->GetWorldInventory() : nullptr;
+
+	ReportDamageForChallenges(Pawn, Controller, CurrentWeapon, Stack);
 
 	if (!WorldInventory || !CurrentWeapon)
 		return NetMulticast_Athena_BatchedDamageCuesOriginal(Context, Stack, Ret);

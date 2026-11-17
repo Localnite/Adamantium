@@ -9,6 +9,7 @@
 #include "botnames.h"
 #include "BotRegistry.h"
 #include "BotBrain.h"
+#include "questStats.h"
 #include "prodopts.h"
 #include "RebootConfig.h"
 
@@ -368,10 +369,29 @@ inline int PlaylistFirstTeam(UFortPlaylist* Playlist)
 	// The game keeps one array slot per team number, 0 up to the last; with 100 teams that ends at the highest valid number. This build has 102 slots
 	// (team 102 was turned down), so the 100 teams are 2-101 and the first real player is team 2, not the 3 Reboot assumes for later seasons.
 	int FromArray = -1;
+	bool bNoTeamsArray = false;
+
+	// Neither the playlist nor the team array may answer (7.30: DefaultFirstTeam reads 25858 and there is no team array). Then a playlist of
+	// 100 single-player teams ends at the highest team the game takes, 101, so it starts at 2. Falling back to 3 left 99 team numbers: the
+	// real player took one and the fill stopped at 98 bots instead of 99 (2026-11-09).
+	int TeamsInPlaylist = 100;
+
+	if (Playlist)
+	{
+		static auto CountOffset = Playlist->GetOffset("MaxTeamCount", false);
+
+		if (CountOffset != -1 && Playlist->Get<int>(CountOffset) > 0 && Playlist->Get<int>(CountOffset) <= 100)
+			TeamsInPlaylist = Playlist->Get<int>(CountOffset);
+	}
+
+	const int FromTop = TeamsInPlaylist >= 99 ? HighestAcceptedTeam - TeamsInPlaylist + 1 : -1; // only for solo-sized playlists: team games keep Reboot's numbering
 
 	if (auto GameState = Cast<AFortGameStateAthena>(GetWorld() ? GetWorld()->GetGameState() : nullptr))
 	{
-		if (auto Container = GameState->GetTeamsArrayContainer())
+		auto Container = GameState->GetTeamsArrayContainer();
+		bNoTeamsArray = !Container;
+
+		if (Container)
 		{
 			int TeamsWanted = 100;
 
@@ -403,6 +423,8 @@ inline int PlaylistFirstTeam(UFortPlaylist* Playlist)
 			Value = FromPlaylist;
 		else if (FromArray != -1)
 			Value = FromArray;
+		else if (FromTop >= 2 && FromTop <= 3)
+			Value = FromTop;
 
 		LOG_INFO(LogTeams, "Teams: the playlist says the first team is {} (using {}); highest team number used is {}", FromPlaylist, Value, HighestAcceptedTeam);
 	}
@@ -410,15 +432,156 @@ inline int PlaylistFirstTeam(UFortPlaylist* Playlist)
 	{
 		if (FromArray != -1)
 			Value = FromArray;
+		else if (FromTop >= 2 && FromTop <= 3)
+			Value = FromTop;
 
 		LOG_INFO(LogTeams, "Teams: the playlist has no DefaultFirstTeam, using {}; highest team number used is {}", Value, HighestAcceptedTeam);
 	}
 
-	if (Playlist && FromArray != -1)
-		Result = Value; // only remember it once the game could be asked
+	// only remember it once the game could be asked (or has nothing to ask: Season 7 has no team array, and the answer was then worked out
+	// again, and logged, for every bot spawned)
+	if (Playlist && (FromArray != -1 || bNoTeamsArray))
+		Result = Value;
 
 	return Value;
 }
+
+// ---- bot skins, loaded before they are needed ----
+// Spawning the bots froze the server for ~7 s with 98 bots (~70 ms a bot, 2026-11-09). Two things in that were per-bot work that does not
+// have to be: every bot walked the whole object array (GetAllObjectsOfClass, hundreds of thousands of objects) to list the skins, and
+// every bot's skin parts were loaded from disk right there (soft pointers, synchronous). Now the skin list is made once, each bot's skin
+// is drawn in advance exactly as before (uniformly at random from all of them, so the bots look as varied as ever), and during warmup
+// those skins' parts are loaded a few at a time, so the spawn itself finds them in memory.
+struct BotHeroPool
+{
+	bool bCollected = false;
+	std::vector<UFortItemDefinition*> All;    // every Athena hero (skin)
+	std::vector<UFortItemDefinition*> Drawn;  // the skin each coming bot will wear, in spawn order
+	size_t NextUse = 0;
+	size_t NextLoad = 0;
+	double NextLoadAt = 0.0;
+	double LoadMs = 0.0;
+	int Loaded = 0;
+};
+
+inline BotHeroPool gHeroPool;
+inline constexpr int BotHeroDraws = 120; // more than a match can hold; past that a bot draws as it spawns
+
+inline void CollectBotHeroes()
+{
+	if (gHeroPool.bCollected)
+		return;
+
+	auto HeroClass = FindObject<UClass>(L"/Script/FortniteGame.FortHeroType");
+	auto AllHeroTypes = GetAllObjectsOfClass(HeroClass);
+
+	for (int i = 0; i < AllHeroTypes.size(); ++i)
+	{
+		auto Hero = (UFortItemDefinition*)AllHeroTypes.at(i);
+
+		if (Hero && Hero->GetPathName().starts_with("/Game/Athena/Heroes/"))
+			gHeroPool.All.push_back(Hero);
+	}
+
+	if (gHeroPool.All.empty())
+		return; // too early (the heroes are not loaded yet): try again later
+
+	gHeroPool.bCollected = true;
+
+	for (int i = 0; i < BotHeroDraws; ++i)
+		gHeroPool.Drawn.push_back(gHeroPool.All.at(std::rand() % gHeroPool.All.size()));
+
+	LOG_INFO(LogBots, "Bot skins: {} to pick from, {} drawn for the coming bots", gHeroPool.All.size(), gHeroPool.Drawn.size());
+}
+
+// The skin for the next bot: the next one drawn in advance, or a fresh random one when those are used up.
+inline UFortItemDefinition* NextBotHero()
+{
+	CollectBotHeroes();
+
+	if (gHeroPool.NextUse < gHeroPool.Drawn.size())
+		return gHeroPool.Drawn[gHeroPool.NextUse++];
+
+	if (!gHeroPool.All.empty())
+		return gHeroPool.All.at(std::rand() % gHeroPool.All.size());
+
+	return nullptr;
+}
+
+// Load a hero's specialisations and character parts (what ApplyHID would load) and keep them from the garbage collector until a bot wears them.
+inline void LoadBotHeroParts(UObject* Hero)
+{
+	static auto SpecializationsOffset = Hero->GetOffset("Specializations", false);
+	static auto FortHeroSpecializationClass = FindObject<UClass>(L"/Script/FortniteGame.FortHeroSpecialization");
+	static auto CustomCharacterPartClass = FindObject<UClass>(L"/Script/FortniteGame.CustomCharacterPart");
+
+	if (SpecializationsOffset == -1)
+		return;
+
+	auto& Specializations = Hero->Get<TArray<TSoftObjectPtr<UObject>>>(SpecializationsOffset);
+
+	for (int i = 0; i < Specializations.Num(); ++i)
+	{
+		auto Specialization = Specializations.at(i).Get(FortHeroSpecializationClass, true);
+
+		if (!Specialization)
+			continue;
+
+		Specialization->AddToRoot();
+		static auto CharacterPartsOffset = Specialization->GetOffset("CharacterParts", false);
+
+		if (CharacterPartsOffset == -1)
+			continue;
+
+		auto& CharacterParts = Specialization->Get<TArray<TSoftObjectPtr<UObject>>>(CharacterPartsOffset);
+
+		for (int z = 0; z < CharacterParts.Num(); ++z)
+		{
+			if (auto Part = CharacterParts.at(z).Get(CustomCharacterPartClass, true))
+				Part->AddToRoot();
+		}
+	}
+}
+
+// Called every server tick: loads the skins of bots not spawned yet, one at a time and spaced out, so warmup never hitches for long.
+inline void PreloadBotHeroes()
+{
+	if (gHeroPool.bCollected && gHeroPool.NextLoad >= gHeroPool.Drawn.size())
+		return;
+
+	const double Now = BotBrain::PerfNow();
+
+	if (Now < gHeroPool.NextLoadAt)
+		return;
+
+	gHeroPool.NextLoadAt = Now + 500.0; // the hero list is not there yet: look again in half a second
+	CollectBotHeroes();
+
+	if (!gHeroPool.bCollected)
+		return;
+
+	// skins already worn need no loading ahead
+	gHeroPool.NextLoad = (std::max)(gHeroPool.NextLoad, gHeroPool.NextUse);
+
+	if (gHeroPool.NextLoad >= gHeroPool.Drawn.size())
+		return;
+
+	const double Start = BotBrain::PerfNow();
+	LoadBotHeroParts(gHeroPool.Drawn[gHeroPool.NextLoad++]);
+	const double Took = BotBrain::PerfNow() - Start;
+	gHeroPool.LoadMs += Took;
+	++gHeroPool.Loaded;
+
+	// a load that came off the disk gets a pause after it; ones already in memory go straight on
+	gHeroPool.NextLoadAt = BotBrain::PerfNow() + (Took > 5.0 ? (std::min)(Took * 3.0, 250.0) : 0.0);
+
+	if (gHeroPool.NextLoad == gHeroPool.Drawn.size() || gHeroPool.Loaded == 10)
+		LOG_INFO(LogBots, "Bot skins: {} of {} loaded ahead ({:.0f} ms spent loading)", gHeroPool.NextLoad, gHeroPool.Drawn.size(), gHeroPool.LoadMs);
+}
+
+// Where the time of a spawn goes (summed over one SpawnBotsAtPlayerStarts call and logged at its end).
+struct BotSpawnTimes { double Actors = 0, Setup = 0, Abilities = 0, Inventory = 0, Skin = 0, Rest = 0; int Count = 0; };
+inline BotSpawnTimes gSpawnTimes;
 
 class PlayerBot
 {
@@ -586,23 +749,10 @@ public:
 
 	void PickRandomLoadout()
 	{
-		auto AllHeroTypes = GetAllObjectsOfClass(FindObject<UClass>(L"/Script/FortniteGame.FortHeroType"));
-		std::vector<UFortItemDefinition*> AthenaHeroTypes;
+		UFortItemDefinition* HeroType = NextBotHero(); // drawn at random in advance, see BotHeroPool
 
-		UFortItemDefinition* HeroType = FindObject<UFortItemDefinition>(L"/Game/Athena/Heroes/HID_030_Athena_Commando_M_Halloween.HID_030_Athena_Commando_M_Halloween");
-
-		for (int i = 0; i < AllHeroTypes.size(); ++i)
-		{
-			auto CurrentHeroType = (UFortItemDefinition*)AllHeroTypes.at(i);
-
-			if (CurrentHeroType->GetPathName().starts_with("/Game/Athena/Heroes/"))
-				AthenaHeroTypes.push_back(CurrentHeroType);
-		}
-
-		if (AthenaHeroTypes.size())
-		{
-			HeroType = AthenaHeroTypes.at(std::rand() % AthenaHeroTypes.size());
-		}
+		if (!HeroType)
+			HeroType = FindObject<UFortItemDefinition>(L"/Game/Athena/Heroes/HID_030_Athena_Commando_M_Halloween.HID_030_Athena_Commando_M_Halloween");
 
 		static auto HeroTypeOffset = PlayerState->GetOffset("HeroType");
 		PlayerState->Get(HeroTypeOffset) = HeroType;
@@ -746,6 +896,9 @@ public:
 			return;
 		}
 
+		double Mark = BotBrain::PerfNow();
+		auto Lap = [&](double& Into) { const double Now = BotBrain::PerfNow(); Into += Now - Mark; Mark = Now; };
+
 		if (!ShouldUseAIBotController())
 		{
 			Controller = GetWorld()->SpawnActor<AController>(ControllerClass);
@@ -770,6 +923,7 @@ public:
 			return;
 		}
 
+		Lap(gSpawnTimes.Actors);
 		PlayerState->SetIsBot(true);
 
 		if (Controller->GetPawn() != Pawn)
@@ -794,6 +948,7 @@ public:
 		Pawn->SetHealth(100);
 		Pawn->SetMaxHealth(100);
 
+		Lap(gSpawnTimes.Setup);
 		auto PlayerAbilitySet = GetPlayerAbilitySet();
 		auto AbilitySystemComponent = PlayerState->GetAbilitySystemComponent();
 
@@ -802,9 +957,12 @@ public:
 			PlayerAbilitySet->GiveToAbilitySystem(AbilitySystemComponent);
 		}
 
+		Lap(gSpawnTimes.Abilities);
 		SetupInventory();
+		Lap(gSpawnTimes.Inventory);
 		PickRandomLoadout();
 		ApplyCosmeticLoadout();
+		Lap(gSpawnTimes.Skin);
 
 		if (!ShouldUseAIBotController())
 		{
@@ -834,6 +992,8 @@ public:
 		BotRegistry::BotControllers.insert(Controller);
 		BOT_CRUMB("Init:EnableBotServerSimulation", Id);
 		EnableBotServerSimulation(Controller, Pawn, PlayerState);
+		Lap(gSpawnTimes.Rest);
+		++gSpawnTimes.Count;
 
 		LOG_INFO(LogDev, "Finished spawning bot!")
 	}
@@ -2192,6 +2352,22 @@ namespace Bots
 
 		// Find playerstart (scuffed)
 
+		gSpawnTimes = BotSpawnTimes{};
+		const double SpawnStart = BotBrain::PerfNow();
+		const size_t SkinsReady = gHeroPool.NextLoad;
+
+		// the summary is logged however the loop ends
+		struct LogAtEnd
+		{
+			double Start; size_t Ready;
+			~LogAtEnd()
+			{
+				const auto& T = gSpawnTimes;
+				LOG_INFO(LogBots, "BotSpawnTime: {} bots in {:.0f} ms ({:.1f} ms a bot): actors {:.0f}, name/team {:.0f}, abilities {:.0f}, inventory {:.0f}, skin {:.0f}, rest {:.0f} ms; {} skins were loaded ahead",
+					T.Count, BotBrain::PerfNow() - Start, T.Count ? (BotBrain::PerfNow() - Start) / T.Count : 0.0, T.Actors, T.Setup, T.Abilities, T.Inventory, T.Skin, T.Rest, Ready);
+			}
+		} SpawnLog{ SpawnStart, SkinsReady };
+
 		for (int i = 0; i < AmountOfBots; ++i)
 		{
 			AActor* PlayerStart = PlayerStarts.at(std::rand() % (PlayerStarts.size() - 1));
@@ -2937,6 +3113,10 @@ namespace Bots
 
 			if (DeadState)
 				KillerState->ClientReportKill(DeadState);
+
+			// challenges: a real player eliminated this bot
+			if (!BotBrain::IsBotPlayerState(KillerState))
+				QuestStats::ReportKill(KillerState, KillerPawn, DeathLocation);
 		}
 
 		{
@@ -3094,6 +3274,9 @@ namespace Bots
 
 	static void Tick()
 	{
+		if (RebootConfig::Get().Bots.bEnabled)
+			PreloadBotHeroes(); // the coming bots' skins, a few at a time during warmup
+
 		if (AllPlayerBotsToTick.size() == 0)
 		{
 			// no bots yet: in fill mode they come just before the bus, so this is where that gets noticed

@@ -1,5 +1,6 @@
 #include "BotRegistry.h"
 #include "FortPlayerController.h"
+#include "questStats.h"
 
 #include "Rotator.h"
 #include "BuildingSMActor.h"
@@ -501,6 +502,9 @@ void AFortPlayerController::ServerAttemptInteractHook(UObject* Context, FFrame* 
 
 		BuildingContainer->SpawnLoot(PlayerController->GetMyFortPawn());
 
+		// challenge progress: a real player searched this container (chests, ammo boxes, ...), described by its own gameplay tags
+		QuestStats::ReportInteract(PlayerController->GetPlayerState(), BuildingContainer);
+
 		// The Zone loot tables don't exist for the Athena picker, so STW containers get zone loot through the
 		// Zone:: search chunk (the onboarding pistol itself comes with the starter kit since Build57)
 		if (Globals::bZoneMode)
@@ -761,6 +765,10 @@ void AFortPlayerController::ServerAttemptInteractHook(UObject* Context, FFrame* 
 			}
 		}
 	}
+
+	// anything else a player uses (quest objects such as the gnomes) counts for challenges too; a container only when it was searched, above
+	if (!Cast<ABuildingContainer>(ReceivingActor))
+		QuestStats::ReportInteract(PlayerController->GetPlayerState(), ReceivingActor);
 
 	return ServerAttemptInteractOriginal(Context, Stack);
 }
@@ -1230,6 +1238,8 @@ void AFortPlayerController::ServerPlayEmoteItemHook(AFortPlayerController* Playe
 	if (!EmoteAsset || !PlayerState || !Pawn)
 		return;
 
+	QuestStats::ReportEmote(PlayerState, Pawn, EmoteAsset); // challenges: dance at a place (a bot's emote never counts, see questStats.h)
+
 	auto AbilitySystemComponent = PlayerState->GetAbilitySystemComponent();
 
 	if (!AbilitySystemComponent)
@@ -1409,6 +1419,10 @@ void AFortPlayerController::ClientOnPawnDiedHook(AFortPlayerController* PlayerCo
 		return ClientOnPawnDiedOriginal(PlayerController, DeathReport);
 
 	auto DeathLocation = DeadPawn->GetActorLocation();
+
+	// challenges: a real player eliminated this one (a bot killer is ignored in QuestStats)
+	if (KillerPlayerState && KillerPlayerState != DeadPlayerState)
+		QuestStats::ReportKill(KillerPlayerState, KillerPawn, DeathLocation);
 
 	static auto FallDamageEnumValue = 1;
 

@@ -1,4 +1,5 @@
 #include "FortPlayerPawn.h"
+#include "questStats.h"
 #include <memcury.h>
 #include "FortPlayerController.h"
 #include "FortGadgetItemDefinition.h"
@@ -122,6 +123,10 @@ void AFortPlayerPawn::ServerHandlePickupWithRequestedSwapHook(UObject* Context, 
 
 	static auto IncomingPickupsOffset = Pawn->GetOffset("IncomingPickups");
 	Pawn->Get<TArray<AFortPickup*>>(IncomingPickupsOffset).Add(Pickup);
+
+	// challenges: collect items (of every rarity, ...); a bot's pickups never count, see questStats.h
+	if (auto Entry = Pickup->GetPrimaryPickupItemEntry())
+		QuestStats::ReportCollect(Pawn->GetPlayerState(), (UObject*)Entry->GetItemDefinition());
 
 	auto PickupLocationData = Pickup->GetPickupLocationData();
 
@@ -354,6 +359,10 @@ void AFortPlayerPawn::ServerHandlePickupHook(AFortPlayerPawn* Pawn, AFortPickup*
 
 	static auto IncomingPickupsOffset = Pawn->GetOffset("IncomingPickups");
 	Pawn->Get<TArray<AFortPickup*>>(IncomingPickupsOffset).Add(Pickup);
+
+	// challenges: collect items (of every rarity, ...); a bot's pickups never count, see questStats.h
+	if (auto Entry = Pickup->GetPrimaryPickupItemEntry())
+		QuestStats::ReportCollect(Pawn->GetPlayerState(), (UObject*)Entry->GetItemDefinition());
 
 	auto PickupLocationData = Pickup->GetPickupLocationData();
 

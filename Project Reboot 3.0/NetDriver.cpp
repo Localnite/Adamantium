@@ -15,6 +15,8 @@
 #include "bots.h"
 #include "gui.h"
 #include "prodmatch.h"
+#include "snow.h"
+#include "questStats.h"
 #include "ZoneFinder.h"
 
 enum class EChannelCloseReason : uint8
@@ -70,6 +72,46 @@ void UNetDriver::TickFlushHook(UNetDriver* NetDriver)
 	if (ProdMatch::Get().bEnabled)
 	{
 		ProdMatch::Tick();
+	}
+
+	Snow::Tick(); // -SNOW_LEVEL: the holiday snow on the map (snow.h)
+
+	// challenge progress facts (questStats.h) go to the backend with the match reports, every couple of seconds
+	{
+		static ULONGLONG NextStats = 0;
+		const ULONGLONG NowMs = GetTickCount64();
+
+		static ULONGLONG NextWatch = 0;
+
+		// every real player once a second: places entered, the landing
+		if (NowMs >= NextWatch && !Globals::bZoneMode)
+		{
+			NextWatch = NowMs + 1000;
+
+			if (auto Driver = GetWorld() ? GetWorld()->GetNetDriver() : nullptr)
+			{
+				auto& Connections = Driver->GetClientConnections();
+
+				for (int i = 0; i < Connections.Num(); ++i)
+				{
+					auto Connection = Connections.At(i);
+					auto PlayerController = Connection ? Connection->GetPlayerController() : nullptr;
+					auto Pawn = PlayerController ? PlayerController->GetPawn() : nullptr;
+
+					if (Pawn)
+						QuestStats::TickPlayer(PlayerController->GetPlayerState(), Pawn);
+				}
+			}
+		}
+
+		if (NowMs >= NextStats)
+		{
+			NextStats = NowMs + 2000;
+			const std::string Facts = QuestStats::Drain();
+
+			if (!Facts.empty() && ProdMatch::Get().bEnabled)
+				ProdMatch::Report::Send("stats", std::format("{{\"matchId\":\"{}\",\"event\":\"stats\",\"stats\":{}}}", ProdMatch::Report::Escape(ProdMatch::Get().MatchId), Facts), false);
+		}
 	}
 
 	if (Globals::bZoneMode)
