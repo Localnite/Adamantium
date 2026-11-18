@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <format>
+#include <chrono>
 
 // #define Log(...) std::cout << std::format(__VA_ARGS__) << '\n';
 
@@ -132,3 +133,26 @@ inline void InitLogger()
 #else
 #define DEBUG_LOG_INFO(loggerName, ...)           
 #endif
+
+// Startup timing: Timing::Begin() at the start of Main(), Timing::Mark("...") at each milestone.
+// Each line shows the time since the previous mark and since Begin(), which makes the scan / hook /
+// map-load split visible in reboot.log instead of having to infer it from unrelated timestamps.
+namespace Timing
+{
+    inline std::chrono::steady_clock::time_point Start;
+    inline std::chrono::steady_clock::time_point Prev;
+
+    inline void Begin()
+    {
+        Start = Prev = std::chrono::steady_clock::now();
+    }
+
+    inline void Mark(const char* What)
+    {
+        const auto Now = std::chrono::steady_clock::now();
+        LOG_INFO(LogInit, "Startup: {} (+{:.3f}s, total {:.3f}s)", What,
+            std::chrono::duration<double>(Now - Prev).count(),
+            std::chrono::duration<double>(Now - Start).count());
+        Prev = Now;
+    }
+}

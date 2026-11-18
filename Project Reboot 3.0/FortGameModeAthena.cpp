@@ -316,6 +316,7 @@ void SetupEverythingAI() // find better name lol
 
 bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* GameMode)
 {
+	Timing::Mark("ReadyToStartMatch called");
 	Globals::bHitReadyToStartMatch = true;
 
 	auto GameState = GameMode->GetGameStateAthena();
@@ -851,7 +852,10 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 		// With a Zone map set the server travels there right after this start, and the old world's beacon and net driver would keep
 		// ports 7776/7777 for good (nothing closes them on travel), pushing the Zone world's listener to 7778. Only the Zone world listens then.
 		if (RebootConfig::Get().Stw.Map.empty())
+		{
 			GetWorld()->Listen();
+			Timing::Mark("Listen called (joinable)");
+		}
 		else
 			LOG_INFO(LogNet, "Not listening in the island world: {} is next", RebootConfig::Get().Stw.Map);
 

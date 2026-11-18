@@ -2662,6 +2662,9 @@ bool ReplicateActorHook(UActorChannel* Channel)
 
 DWORD WINAPI Main(LPVOID)
 {
+    Timing::Begin();
+    Timing::Mark("Main entered");
+
 #ifndef CLIENT_ONLY
     InitLogger();
 
@@ -2676,6 +2679,7 @@ DWORD WINAPI Main(LPVOID)
         LOG_ERROR(LogInit, "Failed to initialize MinHook {}!", MH_StatusToString(MH_InitCode));
         return 1;
     }
+    Timing::Mark("MinHook initialized");
 
     std::cout << std::format("Base Address: 0x{:x}\n", __int64(GetModuleHandleW(0)));
 
@@ -2699,16 +2703,20 @@ DWORD WINAPI Main(LPVOID)
 #endif 
 
     Addresses::SetupVersion();
+    Timing::Mark("version detected");
 
     NumToSubtractFromSquadId = Engine_Version >= 424 ? 2 : Engine_Version >= 423 ? 3 : 0; // TODO: check this
     NumElementsPerChunk = std::floor(Fortnite_Version) >= 5 && Fortnite_Version <= 6 ? 0x10400 : 0x10000; // Idk what version tbh
 
     Offsets::FindAll(); // We have to do this before because FindCantBuild uses FortAIController.CreateBuildingActor
     Offsets::Print();
+    Timing::Mark("offsets found");
 
     Addresses::FindAll();
     Addresses::Init();
     Addresses::Print();
+    Timing::Mark("addresses found");
+    Memcury::ScanCache::Save();
 
     bEnableRebooting = Addresses::RebootingDelegate && Addresses::FinishResurrection && Addresses::GetSquadIdForCurrentPlayer && false;
 
@@ -2747,6 +2755,8 @@ DWORD WINAPI Main(LPVOID)
     }
 #endif
 
+    Timing::Mark("version guard passed");
+
     if (!ProdMatch::Get().bEnabled) // a backend-run server has no display to draw on
     {
         CreateThread(0, 0, GuiThread, 0, 0, 0);
@@ -2756,11 +2766,16 @@ DWORD WINAPI Main(LPVOID)
         LOG_INFO(LogInit, "Prod: no GUI (match '{}')", ProdMatch::Get().MatchId);
     }
 
-    while (SecondsUntilTravel > 0)
+    // A backend-run server has nobody at the keyboard to adjust the GUI's "Seconds until load into map" slider,
+    // so this wait would only delay when the server becomes joinable. Keep it for the GUI path.
+    if (!ProdMatch::Get().bEnabled)
     {
-        SecondsUntilTravel -= 1;
+        while (SecondsUntilTravel > 0)
+        {
+            SecondsUntilTravel -= 1;
 
-        Sleep(1000);
+            Sleep(1000);
+        }
     }
 
     bSwitchedInitialLevel = true;
@@ -2786,45 +2801,10 @@ DWORD WINAPI Main(LPVOID)
     if (Fortnite_Version >= 20 || Fortnite_Version == 12.00)
         ApplyNullAndRetTrues();
 
-    auto ObjectNum = ChunkedObjects ? ChunkedObjects->Num() : UnchunkedObjects ? UnchunkedObjects->Num() : 0;
+    // ObjectsDump.txt is now written only from the GUI's "Dump Objects" button, not on every startup.
 
-    std::ofstream obj("ObjectsDump.txt");
-
-    for (int i = 0; i < ObjectNum; ++i)
-    {
-        auto CurrentObject = GetObjectByIndex(i);
-
-        if (!CurrentObject)
-            continue;
-
-        obj << CurrentObject->GetFullName() << '\n';
-    }
-
-    // UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogNetPackageMap VeryVerbose", nullptr);
-    // UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogNetTraffic VeryVerbose", nullptr);
-    // UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogNet VeryVerbose", nullptr);
-    // UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogNavigation VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFortMission VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFortAIGoalSelection VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFortWorld VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFortPlayerRegistration VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogBuilding VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFortTeams VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFortAI VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFortAIDirector VeryVerbose", nullptr);
-	UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFortUIDirector Fatal", nullptr); // Temporary
-    // UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFortQuest VeryVerbose", nullptr);
-    // UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogAbilitySystem VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogDataTable VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogMeshNetwork VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogEQS VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFort VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogGameMode VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogSpecialEvent VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogPlayerController VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogSpecialEventPhase VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogFortCustomization VeryVerbose", nullptr);
-    UKismetSystemLibrary::ExecuteConsoleCommand(GetWorld(), L"log LogSpecialEventScriptMeshActor VeryVerbose", nullptr);
+    // Engine-side VeryVerbose categories used to be forced on every boot. That is a lot of log I/O (slow under
+    // Wine) and none of it is needed for normal operation; enable individual categories from the console when debugging.
 
     Hooking::MinHook::Hook((PVOID)Addresses::NoMCP, (PVOID)NoMCPHook, nullptr);
     Hooking::MinHook::Hook((PVOID)Addresses::GetNetMode, (PVOID)GetNetModeHook, nullptr);
@@ -2995,8 +2975,12 @@ DWORD WINAPI Main(LPVOID)
 
     */
 
+    Timing::Mark("hooks installed");
+    Memcury::ScanCache::Save();
+
     ChangeLevels();
 
+    Timing::Mark("ChangeLevels issued");
     LOG_INFO(LogDev, "Switched levels.");
 
     if (Fortnite_Version < 20 && Fortnite_Version != 12)
@@ -3660,6 +3644,7 @@ DWORD WINAPI Main(LPVOID)
 
     srand(time(0));
 
+    Timing::Mark("Main finished");
     LOG_INFO(LogHook, "Finished initialization!");
 
     if (false)

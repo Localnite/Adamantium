@@ -51,7 +51,23 @@ inline float gBotFillLead = 20.0f;    // how many seconds before the bus the bot
 inline bool gNavExperiment = false;  // try to bring a navmesh into the map at runtime (see NavProbe in bots.h)
 inline bool gClientShots = false;     // send the game target data like a client (the game ignored it in tests, so off by default)
 inline float gMeleeSlowMult = 0.75f, gMeleeSlowTime = 0.5f; // read from the pawn: how much a swing slows the swinger, and for how long
+inline float gMeleeSwingTime = 0.5667f; // AthenaMeleeWeapons, row Harvest_Pickaxe_Athena_C_T01: SwingTime (SwingPlaySpeed 1)
+                                       // the game's own swing cadence, instead of the old guessed 0.8-1.05 s AI beat
+inline float gMeleeHitTime = 0.1603f;  // PlayerMeleeCombo montage, Swing1 "TriggerAbility" branching-point notify at 0.1603 s
+                                       // (Swing2 at 0.7348): the blow lands there, not at the guessed 0.22 s
 inline bool bRampMotion = true;       // false turns the acceleration ramps off (see RampVelocity)
+inline float gShownAccel = 1000.0f;  // the live Athena movement component reads MaxAcceleration 1000 (measured from a bot-test match);
+                                    // the blueprint template's 750 is not what the running pawn uses. PreReplicateAcceleration packs this for
+                                    // other players; the ramp's error-driven 0..3600 is what made bots look like they were sliding.
+
+// A real player sees from a third-person camera behind and above the pawn, not from the pawn's feet. Defaults are the
+// cooked S7 game values (Athena_PlayerCameraModeBase: FOV 80, CameraSpaceForwardDistance -280, view offset 0/45/75),
+// overwritten from the local APlayerCameraManager if the server has one; obstacle probes stay at pawn level (collision,
+// not sight). Athena_PlayerCameraModeMelee pulls the camera in to 242/31/70 for a swing.
+inline bool gBotCamMeasured = false;
+inline float gBotCamBack = 280.0f, gBotCamRight = 45.0f, gBotCamUp = 75.0f, gBotCamFOV = 80.0f;
+inline float gBodyTurnDeg = 420.0f;   // deg/s when nothing is in the sights: C1S9 replays put the 99th-percentile heading change at
+                                     // 71 deg per ~0.2 s (~355 deg/s); 600 snapped visibly, see the BotFlip reports
 inline float gSprintMaxWalk = 1.0f;    // MaxWalkSpeed while sprinting as a share of the sprint speed (a real player's reads 440 for 550)
 inline bool gSprintAbility = true;     // activate the sprint ability
 inline bool gMoveStyle = true;        // write the pawn's replicated movement style (sprint animation)
@@ -395,6 +411,8 @@ struct BotBrainState
 	float LastHealthTotal = 0.0f;
 	bool bSprintFlag = false;
 	float NextMoveLog = 0.0f;
+	float ShownAccelX = 0.0f, ShownAccelY = 0.0f; // the steady acceleration replicated to other players (a client's held-key value, not the ramp error)
+	float HopZImpulse = 0.0f;    // a railing hop that must clear the lip: written straight to Velocity.Z once, then gravity takes over
 	FVector SpeedPrevPos{};
 	FVector RealPrevPos{};          // where the pawn was at the last movement update, for the speed it really has (see ShownVelocity)
 	float RealPrevTime = 0.0f;
@@ -453,6 +471,7 @@ struct BotBrainState
 		FVector Location{};
 		float Yaw = 0.0f;         // the piece's own yaw
 		float FaceYaw = 0.0f;     // where the builder has to look to place it
+		float FacePitch = 0.0f;   // and how far up/down: a player aims at the spot, it is not spawned behind them
 		bool bFace = true;        // false: overhead or underfoot, no turning needed
 		bool bPlanRamp = false;
 		bool bHide = false;       // a wall to stand behind once it is up
@@ -690,7 +709,7 @@ namespace BotBrain
 	inline constexpr float AutoSuccessTime = 1.5f;           // ... for this long
 	inline constexpr float ReducedDeAggroRange = 4000.0f;    // AthenaAISettings.ReducedDeAggroRange
 	inline constexpr float ReducedDeAggroAfter = 30.0f;      // AthenaAISettings.DurationReduceAggroLimits
-	inline constexpr float MeleeRange = 240.0f;
+	inline constexpr float MeleeRange = 296.0f; // AthenaMeleeWeapons RangeVSEnemies; buildings 288, weak spots 400
 	inline constexpr float ProbeLength = 260.0f;
 	inline constexpr float PoiMinDistance = 1000.0f;   // a travel goal is a point of interest at least this far away...
 	inline constexpr float PoiMaxDistance = 100000.0f; // ...and at most this far
@@ -917,11 +936,12 @@ namespace BotBrain
 			{
 				int TypeBonus = 0;
 
-				if (Contains(Path, "shotgun")) { Info.Kind = EBotItemKind::Gun; Info.bShotgun = true; Info.Range = 1300.0f; Info.Interval = 0.95f; TypeBonus = 4; Info.Damage = 90.0f; }
-				else if (Contains(Path, "sniper")) { Info.Kind = EBotItemKind::Gun; Info.Range = 5000.0f; Info.Interval = 1.7f; TypeBonus = 2; Info.Damage = 100.0f; Info.bSniper = true; }
-				else if (Contains(Path, "assault") || Contains(Path, "rifle")) { Info.Kind = EBotItemKind::Gun; Info.Range = 3500.0f; Info.Interval = 0.22f; TypeBonus = 6; Info.Damage = 30.0f; }
+				// rates and damages from AthenaRangedWeapons (cooked S7): FiringRate is shots/s, DmgPB point-blank per pellet
+				if (Contains(Path, "shotgun")) { Info.Kind = EBotItemKind::Gun; Info.bShotgun = true; Info.Range = 1300.0f; Info.Interval = 1.0f / 0.7f; TypeBonus = 4; Info.Damage = 10.0f * 10.0f; } // 10 pellets x 10
+				else if (Contains(Path, "sniper")) { Info.Kind = EBotItemKind::Gun; Info.Range = 5000.0f; Info.Interval = 1.0f / 1.2f; TypeBonus = 2; Info.Damage = 78.0f; Info.bSniper = true; }
+				else if (Contains(Path, "assault") || Contains(Path, "rifle")) { Info.Kind = EBotItemKind::Gun; Info.Range = 3500.0f; Info.Interval = 1.0f / 5.5f; TypeBonus = 6; Info.Damage = 33.0f; }
 				else if (Contains(Path, "smg") || Contains(Path, "submachine")) { Info.Kind = EBotItemKind::Gun; Info.Range = 2500.0f; Info.Interval = 0.17f; TypeBonus = 5; Info.Damage = 19.0f; }
-				else if (Contains(Path, "pistol") || Contains(Path, "revolver")) { Info.Kind = EBotItemKind::Gun; Info.Range = 2500.0f; Info.Interval = 0.4f; TypeBonus = 1; Info.Damage = 26.0f; }
+				else if (Contains(Path, "pistol") || Contains(Path, "revolver")) { Info.Kind = EBotItemKind::Gun; Info.Range = 2500.0f; Info.Interval = 1.0f / 6.75f; TypeBonus = 1; Info.Damage = 25.0f; }
 
 				if (Info.Kind == EBotItemKind::Gun)
 				{
@@ -1040,6 +1060,94 @@ namespace BotBrain
 		IgnoreList.Free();
 
 		return bBlocked;
+	}
+
+	// The local player's APlayerCameraManager holds the real third-person camera: its location is behind and above the
+	// pawn with a shoulder offset, and its FOV is what the player actually sees. Reading it here (rather than guessing an
+	// offset) keeps the bot sight rays in the same space as the client's view. Bots' own camera managers are not ticked by
+	// the server, so the measured offsets are reused for every bot.
+	inline bool CameraViewPoint(UObject* PlayerController, FVector& Loc, FRotator& Rot, float& FOV)
+	{
+		static int ManagerOffset = -2;
+
+		if (ManagerOffset == -2)
+			ManagerOffset = PlayerController ? PlayerController->GetOffset("PlayerCameraManager", false) : -1;
+
+		if (ManagerOffset < 0)
+			return false;
+
+		auto* Manager = PlayerController->Get<UObject*>(ManagerOffset);
+		if (!Manager) return false;
+
+		static auto LocFn = FindObject<UFunction>("/Script/Engine.PlayerCameraManager.GetCameraLocation");
+		static auto RotFn = FindObject<UFunction>("/Script/Engine.PlayerCameraManager.GetCameraRotation");
+		static auto FovFn = FindObject<UFunction>("/Script/Engine.PlayerCameraManager.GetFOV");
+		if (!LocFn || !RotFn) return false;
+
+		static int LocRet = FindOffsetStruct("/Script/Engine.PlayerCameraManager.GetCameraLocation", "ReturnValue", false);
+		static int RotRet = FindOffsetStruct("/Script/Engine.PlayerCameraManager.GetCameraRotation", "ReturnValue", false);
+		static int FovRet = FovFn ? FindOffsetStruct("/Script/Engine.PlayerCameraManager.GetFOV", "ReturnValue", false) : -1;
+		if (LocRet < 0 || RotRet < 0) return false;
+
+		{
+			std::vector<uint8_t> Params(LocFn->GetPropertiesSize() + 16, 0);
+			Manager->ProcessEvent(LocFn, Params.data());
+			Loc = *(FVector*)(Params.data() + LocRet);
+		}
+		{
+			std::vector<uint8_t> Params(RotFn->GetPropertiesSize() + 16, 0);
+			Manager->ProcessEvent(RotFn, Params.data());
+			Rot = *(FRotator*)(Params.data() + RotRet);
+		}
+		if (FovFn && FovRet >= 0)
+		{
+			std::vector<uint8_t> Params(FovFn->GetPropertiesSize() + 16, 0);
+			Manager->ProcessEvent(FovFn, Params.data());
+			FOV = *(float*)(Params.data() + FovRet);
+		}
+
+		return true;
+	}
+
+	inline void SampleLocalPlayerCamera(double Now)
+	{
+		static double Next = 0.0;
+		if (Now < Next) return;
+		Next = Now + 5.0;
+
+		UObject* PC = GetLocalPlayerController();
+		if (!PC) return;
+
+		FVector CamLoc{}, PawnLoc{};
+		FRotator CamRot{};
+		float FOV = 0.0f;
+		if (!CameraViewPoint(PC, CamLoc, CamRot, FOV)) return;
+
+		auto* FortPC = (AFortPlayerControllerAthena*)PC;
+		auto* Pawn = FortPC->GetMyFortPawn();
+		if (!Pawn) return;
+		PawnLoc = Pawn->GetActorLocation();
+
+		const float Yaw = CamRot.Yaw * 3.14159265358979f / 180.0f;
+		const float Fx = std::cos(Yaw), Fy = std::sin(Yaw);
+		const FVector Delta = CamLoc - PawnLoc;
+		const float Back = -(Delta.X * Fx + Delta.Y * Fy);
+		const float Right = -Delta.X * Fy + Delta.Y * Fx;
+		const float Up = Delta.Z;
+
+		// a camera that is not meaningfully behind/above the pawn is the pawn's own eyes (a first-person build), or unset
+		if (Back > 100.0f && Back < 900.0f && Up > 0.0f && Up < 500.0f && std::fabs(Right) < 400.0f)
+		{
+			gBotCamBack = Back;
+			gBotCamRight = Right;
+			gBotCamUp = Up;
+			if (FOV > 40.0f && FOV < 150.0f) gBotCamFOV = FOV;
+			if (!gBotCamMeasured)
+			{
+				gBotCamMeasured = true;
+				LOG_INFO(LogBots, "BotCam: measured the player camera back {:.0f}, right {:.0f}, up {:.0f}, FOV {:.0f} from {}", Back, Right, Up, gBotCamFOV, PC->GetName());
+			}
+		}
 	}
 
 	// Asks the engine's navigation system for a route. Returns false when there is no navmesh or no route.
@@ -2732,7 +2840,11 @@ namespace BotBrain
 
 		const float Low = (std::min)(gSkillMin, gSkillMax);
 		const float High = (std::max)(gSkillMin, gSkillMax);
-		return Low + (High - Low) * 0.5f * (RandRange(0.0f, 1.0f) + RandRange(0.0f, 1.0f)); // most bots land in the middle of the range
+		// Bottom-heavy, not triangular: C1 replay outcomes are 58% of players with 0 kills, 18% with 1, 19% with 2-4,
+		// 5% with 5+. The old sum-of-two-uniforms put most bots at skill ~50 (2.4 degree aim spread), far too many
+		// sharpshooters for a real lobby. Squaring the roll puts the median near skill 29 (4.8 degrees) and keeps a tail.
+		const float U = RandRange(0.0f, 1.0f);
+		return Low + (High - Low) * U * U;
 	}
 
 	// standard deviation of where a bullet strays from where the bot points, in degrees
@@ -4453,7 +4565,7 @@ namespace BotBrain
 				const bool bTopFound = TraceBlocked(Pawn, IgnoreExtra, FVector{ Ax, Ay, FeetZ + 320.0f }, FVector{ Ax, Ay, FeetZ - 40.0f }, nullptr, nullptr, nullptr, &Top);
 				const float Height = bTopFound ? Top.Z - FeetZ : 0.0f;
 
-				if (bTopFound && Height >= 50.0f && Height < 170.0f) // the knee ray hit it, so it is at least that tall (a jump clears about 170)
+				if (bTopFound && Height >= 45.0f && Height < 170.0f) // 45 is the game's MaxStepHeight: below it the pawn just steps up (a jump clears ~170)
 				{
 					Obs.bHopOver = true;
 					Obs.HopHeight = Height;
@@ -4658,6 +4770,30 @@ namespace BotBrain
 			float ChosenVisible = 0.0f;
 			int Looked = 0;
 
+			// Where a real player's camera is: behind the pawn along the look direction, up and over one shoulder. The offsets
+			// come from the local player's camera manager (SampleLocalPlayerCamera), so the sight rays start in the same space
+			// as the client's view instead of at the pawn's feet. Pull the camera in if it would sit inside a wall (the game's
+			// spring arm does the same).
+			const float CamYaw = (Brain.bHaveAim ? Brain.AimYaw : FacingYaw) * 3.14159265358979f / 180.0f;
+			const float Cf = std::cos(CamYaw), Sf = std::sin(CamYaw);
+			FVector CamPos{
+				Obs.Pos.X - Cf * gBotCamBack - Sf * gBotCamRight,
+				Obs.Pos.Y - Sf * gBotCamBack + Cf * gBotCamRight,
+				Obs.Pos.Z + gBotCamUp
+			};
+			{
+				float Fraction = 1.0f;
+				const FVector Eye{ Obs.Pos.X, Obs.Pos.Y, Obs.Pos.Z + 40.0f };
+
+				if (TraceBlocked(Pawn, HeldWeapon, Eye, CamPos, nullptr, &Fraction) && Fraction < 1.0f)
+				{
+					const float Pull = (std::max)(0.1f, Fraction * 0.9f);
+					CamPos.X = Eye.X + (CamPos.X - Eye.X) * Pull;
+					CamPos.Y = Eye.Y + (CamPos.Y - Eye.Y) * Pull;
+					CamPos.Z = Eye.Z + (CamPos.Z - Eye.Z) * Pull;
+				}
+			}
+
 			for (auto& C : Candidates)
 			{
 				if (Looked >= 3)
@@ -4684,7 +4820,7 @@ namespace BotBrain
 					{
 						++Tried;
 
-						if (!TraceBlocked(Pawn, HeldWeapon, FVector{ Obs.Pos.X, Obs.Pos.Y, Obs.Pos.Z + 40.0f }, FVector{ Obs.Pos.X + Ux * Reach, Obs.Pos.Y + Uy * Reach, C.Info->Pos.Z + Heights[h] }))
+						if (!TraceBlocked(Pawn, HeldWeapon, CamPos, FVector{ C.Info->Pos.X - Ux * 120.0f, C.Info->Pos.Y - Uy * 120.0f, C.Info->Pos.Z + Heights[h] }))
 							++Seen;
 					}
 				}
@@ -5288,23 +5424,19 @@ namespace BotBrain
 		bool bBlockedEvent = false;
 		const char* Why = "";
 
-		if (bRouted && Obs.bProbed && Obs.bLowBlocked && Obs.bHighBlocked)
+		if (bRouted && Obs.bProbed && Obs.bLowBlocked && Obs.bHighBlocked && Brain.BlockedAccum > 0.6f)
 		{
-			// trust the route; the progress check below catches a real obstacle
-			if (Brain.BlockedAccum > 0.6f)
-			{
-				bBlockedEvent = true;
-				Why = "no progress on a route";
-				Brain.NavQueryAt = 0.0f;
-			}
+			// the route has stopped making progress: it is a real obstacle, not just a ray that misread stairs. Report it, then
+			// fall through to the hop/break rules below. Making this an else-if used to swallow every railing hit while a route
+			// was active, which is why bots walked around railings instead of jumping them.
+			bBlockedEvent = true;
+			Why = "no progress on a route";
+			Brain.NavQueryAt = 0.0f;
 		}
-		else if (Obs.bProbed && Obs.bLowBlocked && Obs.bHighBlocked && Obs.bHopOver && !Brain.bBreaking && Obs.BlockerActor && Brain.BreakCount < 60 && IsBreakableBlocker(Brain, Obs.BlockerActor)
-			&& Dist2D(Obs.Pos, Obs.BlockerPoint) < 260.0f)
-		{
-			// a railing or fence that can be broken: break it rather than hoping the jump clears it
-			StartBreak(Brain, Obs, Id, "low and breakable");
-		}
-		else if (Obs.bProbed && Obs.bLowBlocked && Obs.bHighBlocked && Obs.bHopOver && (Obs.Now < Brain.HopUntil || Brain.HopTries < 5 || Brain.HopBlocker != (void*)Obs.BlockerActor))
+
+		// A railing is vaulted, not smashed: the hop has to come before the break branch, otherwise every breakable fence
+		// was pickaxed while the bot never even tried to get over it. Breaking stays as the fallback after the hops run out.
+		if (Obs.bProbed && Obs.bLowBlocked && Obs.bHighBlocked && Obs.bHopOver && (Obs.Now < Brain.HopUntil || Brain.HopTries < 10 || Brain.HopBlocker != (void*)Obs.BlockerActor))
 		{
 			// a railing or low wall: jump over it, straight on (not round it)
 			if (Brain.HopBlocker != (void*)Obs.BlockerActor)
@@ -5313,9 +5445,13 @@ namespace BotBrain
 				Brain.HopTries = 0;
 			}
 
-			if (Obs.Now >= Brain.HopUntil && Dist2D(Obs.Pos, Obs.BlockerPoint) < 170.0f && Obs.MovementMode == 1 && Obs.Now >= Brain.NextJumpAllowed)
+			// The ability jump alone often does not clear a railing on an unpossessed pawn, so HopZImpulse writes the vertical
+			// speed directly. Start early enough for a run-up; do not require MovementMode==Walking, bots on this map spend a lot
+			// of time in Falling (3) over small dips and that used to veto the hop entirely.
+			if (Obs.Now >= Brain.HopUntil && Dist2D(Obs.Pos, Obs.BlockerPoint) < 320.0f && Obs.Now >= Brain.NextJumpAllowed)
 			{
 				Action.bJump = true;
+				Brain.HopZImpulse = 600.0f;
 				Brain.NextJumpAllowed = Obs.Now + 0.9f;
 				Brain.HopUntil = Obs.Now + 0.8f;
 				++Brain.HopTries;
@@ -5325,6 +5461,13 @@ namespace BotBrain
 				if (++Hopped <= 25)
 					LOG_INFO(LogBots, "BotHop #{} jumps over {} ({:.0f} high, try {})", Id, Obs.BlockerActor->GetName(), Obs.HopHeight, Brain.HopTries);
 			}
+		}
+		else if (Obs.bProbed && Obs.bLowBlocked && Obs.bHighBlocked && Obs.bHopOver && !Brain.bBreaking && Obs.BlockerActor
+			&& Brain.BreakCount < 60 && IsBreakableBlocker(Brain, Obs.BlockerActor)
+			&& Dist2D(Obs.Pos, Obs.BlockerPoint) < 260.0f)
+		{
+			// the hops ran out on this fence: now smash it instead of walking round it forever
+			StartBreak(Brain, Obs, Id, "hop failed on a breakable railing");
 		}
 		else if (Obs.bProbed && Obs.bLowBlocked && Obs.bHighBlocked)
 		{
@@ -5368,6 +5511,24 @@ namespace BotBrain
 			Why = "no progress";
 		}
 
+		// Last resort: a low obstacle whose height the top trace could not measure (hopOver=false) used to make the bot
+		// walk around it indefinitely. If it has made no progress against a blocker for a while, at least try to get above it.
+		// The direct Z impulse makes the attempt real even when the game's Jump ability is refused.
+		if (!Action.bJump && Brain.BlockedAccum > 1.2f && Obs.bProbed && Obs.bLowBlocked && Obs.bHighBlocked
+			&& Obs.BlockerActor && Obs.Now >= Brain.NextJumpAllowed)
+		{
+			Action.bJump = true;
+			Brain.HopZImpulse = 600.0f;
+			Brain.NextJumpAllowed = Obs.Now + 1.1f;
+			Brain.BlockedAccum = 0.0f;
+
+			static int Tried = 0;
+
+			if (++Tried <= 25)
+				LOG_INFO(LogBots, "BotHop #{} tries to get above {} after being blocked ({:.0f} high, measured {})",
+					Id, Obs.BlockerActor->GetName(), Obs.HopHeight, Obs.bHopOver ? 1 : 0);
+		}
+
 		// Not getting anywhere and no ray shows why: feel for it with the body (see PawnSweep). What it finds is then treated like any other blocker
 		// below: smashed if it can be (a railing, a fence), jumped at otherwise.
 		if (bBlockedEvent && !Obs.BlockerActor && Obs.SelfPawn && Obs.MovementMode == 1)
@@ -5393,9 +5554,16 @@ namespace BotBrain
 				if (++Logged <= 60)
 					LOG_INFO(LogBots, "BotUnseen #{} is held up by {} at ({:.0f}, {:.0f}, {:.0f}), which no ray saw (breakable={})", Id, Unseen->GetName(), Obs.Pos.X, Obs.Pos.Y, Obs.Pos.Z, bBreakable);
 
-				if (!bBreakable && Obs.Now >= Brain.NextJumpAllowed)
+				if (bBreakable && !Brain.bBreaking && Obs.Now >= Brain.NextJumpAllowed)
+				{
+					// a fence no ray saw still has to be dealt with: the break rule above only runs for ray-seen blockers,
+					// so without this the bot just stood against chainlink fences that it could have smashed
+					StartBreak(Brain, Seen, Id, "unseen railing");
+				}
+				else if (!bBreakable && Obs.Now >= Brain.NextJumpAllowed)
 				{
 					Action.bJump = true;
+					Brain.HopZImpulse = 600.0f;
 					Brain.NextJumpAllowed = Obs.Now + 0.9f;
 				}
 			}
@@ -5788,6 +5956,7 @@ namespace BotBrain
 	}
 
 	inline void DecideEngage(BotBrainState& Brain, const BotObservation& Obs, BotAction& Action, int Id);
+	inline void ReturnFireWhileMoving(BotBrainState& Brain, const BotObservation& Obs, BotAction& Action);
 	inline void DecideRetreat(BotBrainState& Brain, const BotObservation& Obs, BotAction& Action, int Id);
 	inline void DecideHeal(BotBrainState& Brain, const BotObservation& Obs, BotAction& Action, int Id);
 	inline bool TryClimbPlan(BotBrainState& Brain, const BotObservation& Obs, const FVector& Goal, const char* Why, int Id);
@@ -7143,7 +7312,8 @@ namespace BotBrain
 
 		// shot at from a distance in the open: run to something that hides the bot, then come back to the fight
 		if (Obs.Now - Brain.HurtAt < 2.5f && Obs.bHasEnemy && Obs.bEnemyVisible && Obs.EnemyDist > 600.0f && Obs.Health + Obs.Shield < 85.0f && Obs.Now >= Brain.NextCoverAt
-			&& Brain.CoverUntil <= Obs.Now && !gNavTiles.empty() && Obs.MovementMode == 1)
+			&& Brain.CoverUntil <= Obs.Now && !(Obs.bEnemyIsHuman && Obs.Now < Brain.NoFleeUntil)
+			&& !gNavTiles.empty() && Obs.MovementMode == 1)
 		{
 			Brain.NextCoverAt = Obs.Now + 10.0f;
 			FVector Best{};
@@ -7197,6 +7367,9 @@ namespace BotBrain
 
 		if (Brain.CoverUntil > Obs.Now)
 		{
+			// running to cover is not the same as surrender: keep shooting while moving to it
+			ReturnFireWhileMoving(Brain, Obs, Action);
+
 			if (Dist2D(Obs.Pos, Brain.CoverPos) > 140.0f)
 			{
 				MoveToward(Brain, Obs, Action, Brain.CoverPos, SprintSpeed, Id);
@@ -7413,7 +7586,7 @@ namespace BotBrain
 			Action.bAttackMelee = true;
 			Brain.TargetPawn = Obs.EnemyPawn;
 			Brain.TargetDist = Distance;
-			Brain.NextAttackTime = Obs.Now + RandRange(0.8f, 1.05f); // a pickaxe swing takes its time
+			Brain.NextAttackTime = Obs.Now + gMeleeSwingTime + RandRange(0.0f, 0.12f); // the game's own SwingTime
 		}
 	}
 
@@ -7438,13 +7611,42 @@ namespace BotBrain
 		const float Bravery = Brain.Bravery > 0.0f ? Brain.Bravery : 1.0f;
 		const bool bBadlyHurt = Obs.Health + Obs.Shield < 40.0f;
 
-		return Ratio < 0.3f / Bravery || (bBadlyHurt && Enemy > 40.0f && Ratio < 0.7f);
+		// People are worth trading shots with: a full-shield human looks much "stronger" in the ratio, which used to make a
+		// bot that had just been shot run immediately. Require a bigger disadvantage before breaking off a human fight.
+		const float FleeRatio = Obs.bEnemyIsHuman ? 0.18f : 0.3f;
+		const float HurtRatio = Obs.bEnemyIsHuman ? 0.5f : 0.7f;
+		return Ratio < FleeRatio / Bravery || (bBadlyHurt && Enemy > 40.0f && Ratio < HurtRatio);
+	}
+
+	// A bot that is backing off still shoots back: a retreat that never fires reads as "I give up" the moment it is hit.
+	// Kept looser than the aimed shot in DecideEngage because it is firing on the run.
+	inline void ReturnFireWhileMoving(BotBrainState& Brain, const BotObservation& Obs, BotAction& Action)
+	{
+		if (!Obs.bHasEnemy || !Obs.bEnemyVisible || !Obs.bHasGun || Obs.Now < Brain.NextAttackTime)
+			return;
+
+		const float Distance = Dist2D(Obs.Pos, Obs.EnemyPos);
+		const float SkillNow = Brain.Skill < 0.0f ? 30.0f : Brain.Skill;
+		const float FireRange = Obs.HeldRange > 9000.0f ? Obs.HeldRange
+			: (std::min)(Obs.HeldRange, (Obs.bHeldShotgun ? 1100.0f : 3000.0f * (0.6f + 0.4f * SkillNow / 100.0f)));
+		const float YawToEnemy = std::atan2(Obs.EnemyPos.Y - Obs.Pos.Y, Obs.EnemyPos.X - Obs.Pos.X) * RadToDeg;
+
+		if (Distance < FireRange && std::fabs(NormalizeAngle(YawToEnemy - Brain.AimYaw)) < 25.0f)
+		{
+			Action.bAttackRanged = true;
+			Brain.TargetPawn = Obs.EnemyPawn;
+			Brain.TargetDist = Distance;
+			Brain.NextAttackTime = Obs.Now + Obs.HeldInterval + RandRange(0.0f, 0.1f);
+		}
 	}
 
 	// Run directly away from the enemy until it is out of sight, then heal if there is something to heal with.
 	inline void DecideRetreat(BotBrainState& Brain, const BotObservation& Obs, BotAction& Action, int Id)
 	{
 		Action.MaxWalkSpeed = SprintSpeed;
+
+		// break contact, but do not go silent while the enemy is still in front of the muzzle
+		ReturnFireWhileMoving(Brain, Obs, Action);
 
 		if (Obs.MovementMode != 1)
 			return;
@@ -7807,6 +8009,11 @@ namespace BotBrain
 			{
 				Brain.FoughtPawn = Obs.EnemyPawn;
 				Brain.FoughtUntil = Obs.Now + 90.0f;
+
+				// A human who shoots back gets a fight, not a bot that instantly turns tail. Hold the flee/cover decisions
+				// briefly so the bot answers the shot first; it can still break off after that if it is really losing.
+				if (Obs.bEnemyIsHuman && Obs.bEnemyVisible)
+					Brain.NoFleeUntil = Obs.Now + 2.5f;
 			}
 		}
 
@@ -9875,10 +10082,17 @@ namespace BotBrain
 
 	inline void MeleeHit(BotBrainState& Brain, AFortPlayerPawnAthena* Pawn, AFortPlayerStateAthena* PlayerState, int Id)
 	{
-		Attack(Brain, Pawn, PlayerState, false, Id);
+		const bool bActivated = Attack(Brain, Pawn, PlayerState, false, Id);
 		AddSoundNow(Pawn->GetActorLocation(), 900.0f, Pawn, PlayerState ? (int)PlayerState->GetTeamIndex() : -1);
 
 		const float SwingAt = UGameplayStatics::GetTimeSeconds(GetWorld());
+
+		// no swing, no blow: a player's hit only comes from the game's melee ability, not from an AI timer
+		if (!bActivated)
+		{
+			Brain.NextAttackTime = SwingAt + 0.2f;
+			return;
+		}
 
 		// the swing takes a moment to land and the swinger stands for it, then is slowed a little (the game's own figures)
 		Brain.PlantUntil = SwingAt + 0.3f;
@@ -9888,7 +10102,7 @@ namespace BotBrain
 			return;
 
 		Brain.MeleeTarget = Brain.TargetPawn;
-		Brain.MeleeDamageAt = SwingAt + 0.22f;
+		Brain.MeleeDamageAt = SwingAt + gMeleeHitTime;
 	}
 
 	// the blow of a pickaxe swing arriving: only if the target is still within reach
@@ -10085,10 +10299,16 @@ namespace BotBrain
 		}
 		else
 		{
-			Brain.NextHarvestHit = Brain.LastDecisionTime + RandRange(0.8f, 1.05f);
+			Brain.NextHarvestHit = Brain.LastDecisionTime + gMeleeSwingTime + RandRange(0.0f, 0.12f);
 		}
 
-		Attack(Brain, Pawn, PlayerState, false, Id);
+		// a harvest blow only lands if the pickaxe swing ability actually started (it can be refused on cooldown, like a
+		// player's click while the previous swing is still playing)
+		if (!Attack(Brain, Pawn, PlayerState, false, Id))
+		{
+			Brain.NextHarvestHit = Brain.LastDecisionTime + 0.2f;
+			return false;
+		}
 
 		static std::vector<uint8_t> HitBuffer(512, 0), ContextBuffer(128, 0);
 		std::fill(HitBuffer.begin(), HitBuffer.end(), 0);
@@ -10537,6 +10757,13 @@ namespace BotBrain
 
 	// A wooden wall on the nearest tile edge towards Toward. Building tiles are 512 wide with their centres on multiples of 512; a wall sits on an edge, 256 from the centre.
 	// The wall is only asked for here: StepBuildQueue puts it up once the bot faces that way.
+	// a player aims at the piece: the pitch is the angle from the eye to the middle of the build spot
+	inline float PitchToBuild(const FVector& Eye, const FVector& Spot)
+	{
+		const float Horizontal = std::sqrt((Spot.X - Eye.X) * (Spot.X - Eye.X) + (Spot.Y - Eye.Y) * (Spot.Y - Eye.Y));
+		return std::atan2(Spot.Z - Eye.Z, Horizontal) * RadToDeg;
+	}
+
 	inline void QueueWallToward(BotBrainState& Brain, AFortPlayerPawnAthena* Pawn, const FVector& Toward, float Now)
 	{
 		const FVector Pos = Pawn->GetActorLocation();
@@ -10553,6 +10780,7 @@ namespace BotBrain
 		Order.Location = bAlongX ? FVector{ CentreX + SignX * 256.0f, CentreY, Base } : FVector{ CentreX, CentreY + SignY * 256.0f, Base };
 		Order.Yaw = bAlongX ? 0.0f : 90.0f;
 		Order.FaceYaw = bAlongX ? (SignX > 0.0f ? 0.0f : 180.0f) : (SignY > 0.0f ? 90.0f : -90.0f);
+		Order.FacePitch = PitchToBuild(FVector{ Pos.X, Pos.Y, Pos.Z + 40.0f }, FVector{ Order.Location.X, Order.Location.Y, Order.Location.Z + 80.0f });
 		Order.bHide = true;
 		Order.HidePos = FVector{ CentreX + (bAlongX ? SignX * 175.0f : 0.0f), CentreY + (bAlongX ? 0.0f : SignY * 175.0f), Pos.Z };
 		Order.Toward = Toward;
@@ -10593,6 +10821,7 @@ namespace BotBrain
 				Order.Location = FVector{ CentreX + Sx * 256.0f, CentreY + Sy * 256.0f, Base + TileRise * Layer };
 				Order.Yaw = Sx != 0.0f ? 0.0f : 90.0f;
 				Order.FaceYaw = Side * 90.0f;
+				Order.FacePitch = PitchToBuild(FVector{ Pos.X, Pos.Y, Pos.Z + 40.0f }, FVector{ Order.Location.X, Order.Location.Y, Order.Location.Z + 80.0f });
 				Order.bBox = true;
 				Order.QueuedAt = Now;
 				Brain.BuildQueue.push_back(Order);
@@ -10605,7 +10834,9 @@ namespace BotBrain
 			BotBrainState::BuildOrder Order;
 			Order.Kind = PieceRoof;
 			Order.Location = FVector{ CentreX, CentreY, Base + TileRise * Layers };
-			Order.bFace = false;
+			// a roof is over the bot's head: it still has to tilt up to place it, just as a player does
+			Order.FaceYaw = Brain.bHaveAim ? Brain.AimYaw : 0.0f;
+			Order.FacePitch = 70.0f;
 			Order.QueuedAt = Now;
 			Brain.BuildQueue.push_back(Order);
 		}
@@ -10663,13 +10894,17 @@ namespace BotBrain
 
 		if (Order.bFace)
 		{
-			// a builder flicks round quickly, but it is still a turn
-			const float Step = 720.0f * Dt;
+			// turn at the same rate the bot turns its body in the world (measured from real C1 replays), not an instant flick:
+			// a player has to swing the view onto the piece before they can place it
+			const float Step = gBodyTurnDeg * Dt;
 			Brain.AimYaw = NormalizeAngle(Brain.AimYaw + (std::max)(-Step, (std::min)(Step, NormalizeAngle(Order.FaceYaw - Brain.AimYaw))));
+			Brain.AimPitch += (std::max)(-Step, (std::min)(Step, Order.FacePitch - Brain.AimPitch));
 			Brain.bHaveAim = true;
 		}
 
-		if (Now < Brain.NextPieceAt || (Order.bFace && std::fabs(NormalizeAngle(Order.FaceYaw - Brain.AimYaw)) > 50.0f))
+		// wait until the view actually rests on the build spot: a loose yaw gate used to let the bot drop pieces behind itself
+		if (Now < Brain.NextPieceAt
+			|| (Order.bFace && (std::fabs(NormalizeAngle(Order.FaceYaw - Brain.AimYaw)) > 12.0f || std::fabs(Order.FacePitch - Brain.AimPitch) > 15.0f)))
 			return true;
 
 		Brain.BuildQueue.erase(Brain.BuildQueue.begin());
@@ -11035,6 +11270,12 @@ namespace BotBrain
 			&& std::fabs(NormalizeAngle(std::atan2(Action.DirY, Action.DirX) * RadToDeg - Brain.AimYaw)) > 55.0f)
 			MoveSpeed = (std::min)(MoveSpeed, WalkSpeed);
 
+		// A player's pickaxe swing uses MeleeCombatSlowSpeedMultiplier/Duration, read from the pawn below. That slow was only
+		// applied to the speed asked for in Decide, but the velocity written here is what the game and other clients see: the
+		// bot kept sprinting at full speed with the swing animation playing. Apply it to the actual velocity as well.
+		if (Now < Brain.MeleeSlowUntil || Now < Brain.PlantUntil)
+			MoveSpeed = (std::min)(MoveSpeed, WalkSpeed * gMeleeSlowMult);
+
 		{
 			const bool bSprinting = bOnGround && Action.bDriveXY && MoveSpeed >= SprintSpeed * 0.95f;
 
@@ -11224,9 +11465,9 @@ namespace BotBrain
 			const float Dt = (std::min)(Now - Brain.AimLastTime, 0.1f);
 			const float Skill = Brain.Skill < 0.0f ? 30.0f : Brain.Skill;
 			// the slow, skill-bound turn is the gun coming round onto a target; a bot with nothing in its sights (running away, running to cover)
-			// turns its body to where it runs as fast as anyone does, or it would run off backwards for a second or two
+			// still turns its body, but real C1 replays rarely exceed ~355 deg/s, so cap it instead of snapping at 600
 			const bool bAimingAtSomeone = Brain.AimTarget && Now - Brain.AimTargetTime < 0.6f;
-			const float Step = (bAimingAtSomeone ? TurnRate(Skill) : 600.0f) * Dt;
+			const float Step = (bAimingAtSomeone ? TurnRate(Skill) : gBodyTurnDeg) * Dt;
 			const float Ease = bAimingAtSomeone ? 1.0f - std::exp(-AimSettleRate(Skill) * Dt) : 1.0f;   // share of the remaining gap closed this tick
 			const float YawGap = NormalizeAngle(DesiredYaw - Brain.AimYaw);
 			const float PitchGap = DesiredPitch - Brain.AimPitch;
@@ -11267,7 +11508,8 @@ namespace BotBrain
 		if (bBuildingNow || (Brain.bHaveFaceYaw && (Action.bFace || bCombat)))
 			SetYaw(Pawn, Brain.AimYaw);
 
-		if (Action.bSetPitch || bCombat)
+		// a build needs the pawn to visibly tilt to the piece even with no enemy in sight
+		if (Action.bSetPitch || bCombat || bBuildingNow)
 			SetAimPitch(Pawn, Brain.AimPitch);
 
 		if (bUseInput && AddMoveInput(Pawn, Action.DirX, Action.DirY))
@@ -11310,6 +11552,17 @@ namespace BotBrain
 				Acceleration.Y = Dy * MoveSpeed;
 			}
 
+			// What other players see is this acceleration (PreReplicateAcceleration packs it, their OnRep plays the walk/run). The ramp writes an
+			// error-driven 0 or 2600/3600 which reads as a series of shoves and stops: the skating. A client holds the key at a steady value, so
+			// ease towards that instead, and keep the direction of travel rather than the direction of the ramp error.
+			{
+				const float Ease = 1.0f - std::exp(-10.0f * MoveDt);
+				Brain.ShownAccelX += (Dx * gShownAccel - Brain.ShownAccelX) * Ease;
+				Brain.ShownAccelY += (Dy * gShownAccel - Brain.ShownAccelY) * Ease;
+				Acceleration.X = Brain.ShownAccelX;
+				Acceleration.Y = Brain.ShownAccelY;
+			}
+
 			// the movement component rebuilds its acceleration from the pending input every tick (zero for a bot), and that is what gets replicated
 			// to the other players, whose walk animation depends on it. The pawn packs that acceleration for the other players in absolute units
 			// (AFortPlayerPawn::PreReplicateAcceleration: size/4096 in a byte, plus a direction byte) and their side then uses it as is
@@ -11338,14 +11591,23 @@ namespace BotBrain
 			{
 				Velocity.X = 0.0f;
 				Velocity.Y = 0.0f;
-				Acceleration.X = 0.0f;
-				Acceleration.Y = 0.0f;
 			}
+
+			// let go of the stick: the replicated acceleration fades instead of snapping to zero
+			Brain.ShownAccelX *= 0.6f;
+			Brain.ShownAccelY *= 0.6f;
+			Acceleration.X = Brain.ShownAccelX;
+			Acceleration.Y = Brain.ShownAccelY;
 		}
 		else if (bOnGround)
 		{
 			Velocity.X *= 0.5f; // nothing asked for: with the braking off it would otherwise slide on
 			Velocity.Y *= 0.5f;
+
+			Brain.ShownAccelX *= 0.6f;
+			Brain.ShownAccelY *= 0.6f;
+			Acceleration.X = Brain.ShownAccelX;
+			Acceleration.Y = Brain.ShownAccelY;
 		}
 
 		{
@@ -11374,6 +11636,14 @@ namespace BotBrain
 
 		if (Action.bDriveZ)
 			Velocity.Z = Action.VerticalSpeed;
+
+		// a railing hop: write the vertical speed once (the engine then applies gravity) so it clears even when the
+		// game's Jump ability is refused because the unpossessed pawn is already in Falling mode
+		if (Brain.HopZImpulse > 0.0f)
+		{
+			Velocity.Z = Brain.HopZImpulse;
+			Brain.HopZImpulse = 0.0f;
+		}
 
 		if (Action.bWarp)
 		{
@@ -11414,6 +11684,8 @@ namespace BotBrain
 			Order.Location = Piece.Location;
 			Order.Yaw = Piece.Yaw;
 			Order.FaceYaw = Piece.Yaw; // ramps and their walls go up ahead, the way the run goes
+			Order.FacePitch = PitchToBuild(FVector{ Pawn->GetActorLocation().X, Pawn->GetActorLocation().Y, Pawn->GetActorLocation().Z + 40.0f },
+				FVector{ Piece.Location.X, Piece.Location.Y, Piece.Location.Z + 40.0f });
 			Order.bPlanRamp = Piece.bPlanRamp;
 			Order.QueuedAt = Now;
 			Brain.BuildQueue.push_back(Order);
@@ -11590,6 +11862,8 @@ namespace BotBrain
 
 		Brain.Controller = Controller;
 
+		SampleLocalPlayerCamera(Now); // throttled internally; measures the real BR camera once every few seconds
+
 		{
 			const float Total = Pawn->GetHealth() + Pawn->GetShield();
 
@@ -11609,9 +11883,9 @@ namespace BotBrain
 			Brain.Aggression = (RandRange(0.05f, 0.65f) * RandRange(0.4f, 1.0f) + 0.05f) * 1.35f; // most bots are loot-first; a few are fighters
 			Brain.Skill = RollSkill();
 
-			// Real battle royale lobbies have a long tail: most players get 0-1 kills and a few get five or more (real solo data: 56% of players 0 kills, 3% five or more).
+			// Real battle royale lobbies have a long tail: the 23 C1 replays give 58% with 0 kills and 5% with 5 or more.
 			// A few bots are those players: sharper, bolder, and keen to fight.
-			if (gSkillFixed < 0.0f && RandRange(0.0f, 1.0f) < 0.07f)
+			if (gSkillFixed < 0.0f && RandRange(0.0f, 1.0f) < 0.05f)
 			{
 				Brain.Skill = RandRange(72.0f, 95.0f);
 				Brain.Aggression = (std::max)(Brain.Aggression, RandRange(0.8f, 1.2f));

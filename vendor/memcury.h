@@ -44,6 +44,8 @@
     #include <vector>
     #include <stdexcept>
     #include <type_traits>
+    #include <unordered_map>
+    #include <fstream>
     #include <intrin.h>
     #include <Windows.h>
     #include <source_location>
@@ -72,6 +74,119 @@
 
     namespace Memcury
     {
+        // Resolved signature/string-reference offsets, persisted so a fresh game process does not repeat the
+        // ~250 full-image scans on every match start. Stored as RVA (address - module base), keyed by exe
+        // identity so a game update invalidates the file. A value of 0 means "not found"; found RVAs are
+        // stored +1 so a hit at offset 0 cannot be confused with a miss.
+        namespace ScanCache
+        {
+            inline bool Loaded = false;
+            inline bool Dirty = false;
+            inline std::unordered_map<std::string, uintptr_t> Entries;
+            inline std::wstring FilePath;
+
+            inline std::wstring CachePath()
+            {
+                wchar_t Exe[MAX_PATH] = {};
+                GetModuleFileNameW(nullptr, Exe, MAX_PATH);
+
+                WIN32_FILE_ATTRIBUTE_DATA Attr{};
+                uint64_t Stamp = 0;
+                if (GetFileAttributesExW(Exe, GetFileExInfoStandard, &Attr))
+                {
+                    Stamp = ((uint64_t)Attr.nFileSizeHigh << 32) | Attr.nFileSizeLow;
+                    Stamp ^= ((uint64_t)Attr.ftLastWriteTime.dwHighDateTime << 32) | Attr.ftLastWriteTime.dwLowDateTime;
+                }
+
+                // Keep the cache beside the game exe (reboot.log / reboot.ini live there too). %TEMP% under
+                // Proton/Wine can be per-run, which would silently make every launch cold.
+                std::wstring Dir(Exe);
+                const size_t Slash = Dir.find_last_of(L"\\/");
+                if (Slash != std::wstring::npos) Dir.resize(Slash + 1);
+
+                return Dir + L"reboot-scan-cache-" + std::to_wstring(Stamp) + L".txt";
+            }
+
+            inline void EnsureLoaded()
+            {
+                if (Loaded) return;
+                Loaded = true;
+                FilePath = CachePath();
+
+                std::ifstream In(FilePath);
+                std::string Line;
+                while (std::getline(In, Line))
+                {
+                    if (Line.rfind("REBOTSCAN1", 0) == 0) continue;
+
+                    const size_t Tab = Line.find('\t');
+                    if (Tab == std::string::npos) continue;
+
+                    try
+                    {
+                        Entries[Line.substr(0, Tab)] = (uintptr_t)std::stoull(Line.substr(Tab + 1), nullptr, 16);
+                    }
+                    catch (...) {}
+                }
+            }
+
+            inline bool Get(const std::string& Key, uintptr_t& Value)
+            {
+                EnsureLoaded();
+                const auto It = Entries.find(Key);
+                if (It == Entries.end()) return false;
+                Value = It->second;
+                return true;
+            }
+
+            inline void Set(const std::string& Key, uintptr_t Value)
+            {
+                EnsureLoaded();
+                Entries[Key] = Value;
+                Dirty = true;
+            }
+
+            // Called once after the startup scan pass; writing on every hit would cost more than the scans.
+            inline void Save()
+            {
+                if (!Loaded || !Dirty) return;
+                Dirty = false;
+
+                std::ofstream Out(FilePath, std::ios::trunc);
+                if (!Out) return;
+
+                Out << "REBOTSCAN1\n";
+                for (const auto& Entry : Entries)
+                    Out << Entry.first << '\t' << std::hex << Entry.second << '\n';
+            }
+
+            template <typename T>
+            inline std::string TextKey(const T& Value)
+            {
+                if constexpr (std::is_pointer_v<std::decay_t<T>>)
+                {
+                    if (!Value) return std::string();
+                    using Pointed = std::remove_cv_t<std::remove_pointer_t<std::decay_t<T>>>;
+                    if constexpr (std::is_same_v<Pointed, wchar_t>)
+                    {
+                        std::string Out;
+                        for (auto P = Value; *P; ++P) Out += (char)*P;
+                        return Out;
+                    }
+                    else
+                    {
+                        return std::string(Value);
+                    }
+                }
+                else
+                {
+                    std::string Out;
+                    for (auto C : Value) Out += (char)C;
+                    return Out;
+                }
+            }
+        }
+
         extern "C" IMAGE_DOS_HEADER __ImageBase;
 
         inline auto GetCurrentModule() -> HMODULE
@@ -717,6 +832,13 @@
 
             static auto FindPattern(const char* signature, bool bWarnIfNotFound = true, int skip = 0) -> Scanner
             {
+                const uintptr_t Base = (uintptr_t)PE::GetModuleBase();
+                const std::string Key = "P|" + std::string(signature) + "|" + std::to_string(skip);
+
+                uintptr_t Encoded = 0;
+                if (ScanCache::Get(Key, Encoded))
+                    return Scanner(PE::Address(Encoded ? Base + Encoded - 1 : 0));
+
                 PE::Address add{ nullptr };
 
                 const auto sizeOfImage = PE::GetNTHeaders()->OptionalHeader.SizeOfImage;
@@ -761,6 +883,8 @@
                     }
                 }
 
+                const uintptr_t Found = add.Get();
+                ScanCache::Set(Key, Found ? Found - Base + 1 : 0);
                 return Scanner(add);
             }
 
@@ -833,6 +957,14 @@
             template <typename T = const wchar_t*>
             static auto FindStringRef(T string, bool bWarnIfNotFound = true, int useRefNum = 0, bool bIsInFunc = false, bool bSkunky = false) -> Scanner
             {
+                const uintptr_t Base = (uintptr_t)PE::GetModuleBase();
+                const std::string Key = "S|" + ScanCache::TextKey(string) + "|" + std::to_string(useRefNum) + "|"
+                    + std::to_string((bWarnIfNotFound ? 8 : 0) | (bIsInFunc ? 4 : 0) | (bSkunky ? 2 : 0));
+
+                uintptr_t Encoded = 0;
+                if (ScanCache::Get(Key, Encoded))
+                    return Scanner(PE::Address(Encoded ? Base + Encoded - 1 : 0));
+
                 PE::Address add{ nullptr };
 
                 constexpr auto bIsWide = std::is_same<T, const wchar_t*>::value;
@@ -953,12 +1085,16 @@
 
                                 auto ref = FindPointerRef(beginFunc.GetAs<void*>());
 
+                                const uintptr_t RefFound = ref.Get();
+                                ScanCache::Set(Key, RefFound ? RefFound - Base + 1 : 0);
                                 return ref;
                             }
                         }
                     }
                 }
 
+                const uintptr_t Found = add.Get();
+                ScanCache::Set(Key, Found ? Found - Base + 1 : 0);
                 return Scanner(add);
             }
 
