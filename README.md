@@ -54,7 +54,24 @@ Our implementations of those ideas live in `Project Reboot 3.0/BotRules.h` and a
 ## License
 
 This project is licensed under the BSD-3-Clause license.
+## AI Disclosure
+
+AI was used in this Project
+
+Models used:
+```
+Claude Haiku 5.5 (Claude Code)
+Claude Sonnet 5.5 (Claude Code)
+Claude Opus 5.5 (Claude Code)
+Claude Fable 5.2 (Claude Code)
+Gemini 4 Carbon (Antigravity CLI)
+Gemini 4 Argon (Antigravity CLI)
+Hy4 Flash (OpenCode)
+GLM 5.3 Flash (OpenCode)
+```
 
 ---
 
 **Note**: Adamantium is a work in progress, and further updates and enhancements are planned. Explore, experiment, and contribute to make it even better! 🚀
+
+
