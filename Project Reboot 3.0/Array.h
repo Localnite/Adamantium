@@ -353,7 +353,7 @@ public:
 
 	void FreeReal(SizeType Size = sizeof(InElementType))
 	{
-		if (!IsBadReadPtr(Data, 8) && ArrayNum > 0 && sizeof(InElementType) > 0)
+		if (RebootIsReadable(Data, 8) && ArrayNum > 0 && sizeof(InElementType) > 0)
 		{
 			for (int i = 0; i < ArrayNum; ++i)
 			{

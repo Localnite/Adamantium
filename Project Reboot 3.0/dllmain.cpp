@@ -2766,9 +2766,9 @@ DWORD WINAPI Main(LPVOID)
         LOG_INFO(LogInit, "Prod: no GUI (match '{}')", ProdMatch::Get().MatchId);
     }
 
-    // A backend-run server has nobody at the keyboard to adjust the GUI's "Seconds until load into map" slider,
-    // so this wait would only delay when the server becomes joinable. Keep it for the GUI path.
-    if (!ProdMatch::Get().bEnabled)
+    // Nobody is at the keyboard on a backend-run server or a bots-only test match, so the GUI's
+    // "Seconds until load into map" wait would only delay when the server becomes joinable.
+    if (!ProdMatch::Get().bEnabled && !Bots::TestOptions().bEnabled)
     {
         while (SecondsUntilTravel > 0)
         {

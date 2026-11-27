@@ -62,13 +62,13 @@ namespace QuestStats
 
 		uint8_t* Object = *(uint8_t**)((uint8_t*)PlayerState + UniqueIdOffset + 8);
 
-		if (!Object || IsBadReadPtr(Object, 40) || *(uint8_t**)(Object + 8) != Object)
+		if (!Object || !RebootIsReadable(Object, 40) || *(uint8_t**)(Object + 8) != Object)
 			return "";
 
 		const wchar_t* Text = *(wchar_t**)(Object + 24);
 		const int Length = *(int*)(Object + 32);
 
-		if (!Text || Length < 8 || Length > 64 || IsBadReadPtr(Text, Length * 2))
+		if (!Text || Length < 8 || Length > 64 || !RebootIsReadable(Text, Length * 2))
 			return "";
 
 		std::string Out;
@@ -292,7 +292,7 @@ namespace QuestStats
 		F.Target = Join({ "Homebase.Class", "Athena.Player" }, LocationTagsAt(VictimAt));
 		F.Source = { "Homebase.Class" };
 
-		if (KillerPawn && !IsBadReadPtr(KillerPawn, 8))
+		if (KillerPawn && RebootIsReadable(KillerPawn, 8))
 		{
 			F.Source = Join(F.Source, LocationTagsAt(KillerPawn->GetActorLocation()));
 

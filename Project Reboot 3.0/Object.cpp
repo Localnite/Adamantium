@@ -248,7 +248,7 @@ bool UObject::IsValidLowLevel()
 		// UE_LOG(LogUObjectBase, Warning, TEXT("NULL object"));
 		return false;
 	}
-	if (IsBadReadPtr(this, 8)) // needed? (milxnor)
+	if (!RebootIsReadable(this, 8)) // IsBadReadPtr faults under Wine instead of returning TRUE
 	{
 		return false;
 	}

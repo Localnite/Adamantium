@@ -31,6 +31,18 @@ namespace RebootConfig
 		bool bExit = false;         // test: close the server when it ends
 		bool bNavBuild = false;     // explore the navigation map, save it and close
 		std::string Playlist;       // playlist to play, empty = the default
+
+		// Overnight-search knobs (defaults are the shipped values; -reboot.Bots.<Key>=<value> overrides each).
+		float FleeRatio = 0.18f;      // human flee ratio (survival / aggression)
+		float HurtRatio = 0.5f;       // badly-hurt flee ratio
+		float PreferredGain = 0.35f;  // how strongly combat biases pull the preferred range
+		float PushGain = 0.6f;        // ramp-push odds multiplier from PushBias
+		float BuildGain = 0.7f;       // build-under-fire odds multiplier from BuildBias
+		float ModelGain = 0.12f;      // per-step increase of the modelled enemy aggression
+		float AmbushBase = 0.55f;     // aggression under which a bot holds a sightline/ambushes
+		float ChestDist = 170.0f;     // max distance to open a chest without a visibility trace
+		float PieceGap = 0.35f;       // seconds between placed building pieces
+		float StuckAccum = 0.6f;      // no-progress seconds before a blocked event
 	};
 
 	struct SaveTheWorld
@@ -224,6 +236,16 @@ namespace RebootConfig
 		Out.Bots.bExit = Flag(L"Bots", L"Exit", Out.Bots.bExit);
 		Out.Bots.bNavBuild = Flag(L"Bots", L"NavBuild", Out.Bots.bNavBuild);
 		Out.Bots.Playlist = Text(L"Bots", L"Playlist", "");
+		Out.Bots.FleeRatio = (float)Number(L"Bots", L"FleeRatio", Out.Bots.FleeRatio);
+		Out.Bots.HurtRatio = (float)Number(L"Bots", L"HurtRatio", Out.Bots.HurtRatio);
+		Out.Bots.PreferredGain = (float)Number(L"Bots", L"PreferredGain", Out.Bots.PreferredGain);
+		Out.Bots.PushGain = (float)Number(L"Bots", L"PushGain", Out.Bots.PushGain);
+		Out.Bots.BuildGain = (float)Number(L"Bots", L"BuildGain", Out.Bots.BuildGain);
+		Out.Bots.ModelGain = (float)Number(L"Bots", L"ModelGain", Out.Bots.ModelGain);
+		Out.Bots.AmbushBase = (float)Number(L"Bots", L"AmbushBase", Out.Bots.AmbushBase);
+		Out.Bots.ChestDist = (float)Number(L"Bots", L"ChestDist", Out.Bots.ChestDist);
+		Out.Bots.PieceGap = (float)Number(L"Bots", L"PieceGap", Out.Bots.PieceGap);
+		Out.Bots.StuckAccum = (float)Number(L"Bots", L"StuckAccum", Out.Bots.StuckAccum);
 
 		Out.Stw.bEnabled = Flag(L"SaveTheWorld", L"Enabled", Out.Stw.bEnabled);
 		Out.Stw.Map = Text(L"SaveTheWorld", L"Map", "");

@@ -309,6 +309,16 @@ inline void* FindPropertyStruct(const std::string& StructName, const std::string
 
 inline int FindOffsetStruct(const std::string& StructName, const std::string& MemberName, bool bWarnIfNotFound = true)
 {
+	// Struct layouts never change at runtime, but FindObject walks GObjects on every call and
+	// startup asks for hundreds of offsets. Cache successful lookups only; a miss is retried later
+	// (some structs are not loaded until the map is ready).
+	static std::unordered_map<std::string, int> OffsetCache;
+	const std::string Key = StructName + "\x1f" + MemberName;
+	auto Cached = OffsetCache.find(Key);
+
+	if (Cached != OffsetCache.end())
+		return Cached->second;
+
 	UObject* Struct = FindObject(StructName);
 
 	if (!Struct)
@@ -316,7 +326,7 @@ inline int FindOffsetStruct(const std::string& StructName, const std::string& Me
 		if (bWarnIfNotFound)
 			LOG_WARN(LogFinder, "Unable to find struct {}", StructName);
 
-		return 0;
+		return 0; // struct not loaded yet: retry on the next call
 	}
 
 	// LOG_INFO(LogFinder, "Struct: {}", Struct->GetFullName());
@@ -331,7 +341,7 @@ inline int FindOffsetStruct(const std::string& StructName, const std::string& Me
 
 			if (PropName == MemberName)
 			{
-				return *(int*)(__int64(Property) + Offsets::Offset_Internal);
+				return OffsetCache.emplace(Key, *(int*)(__int64(Property) + Offsets::Offset_Internal)).first->second;
 			}
 
 			while (Property)
@@ -340,7 +350,7 @@ inline int FindOffsetStruct(const std::string& StructName, const std::string& Me
 
 				if (PropName == MemberName)
 				{
-					return *(int*)(__int64(Property) + Offsets::Offset_Internal);
+					return OffsetCache.emplace(Key, *(int*)(__int64(Property) + Offsets::Offset_Internal)).first->second;
 				}
 
 				Property = GetNext(Property);
@@ -352,7 +362,7 @@ inline int FindOffsetStruct(const std::string& StructName, const std::string& Me
 	if (bWarnIfNotFound)
 		LOG_WARN(LogFinder, "Unable to find1 {}", MemberName);
 
-	return -1;
+	return -1; // a real miss: do not cache, the struct may not be loaded yet
 }
 
 // template <typename T>

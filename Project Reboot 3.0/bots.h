@@ -12,6 +12,7 @@
 #include "questStats.h"
 #include "prodopts.h"
 #include "RebootConfig.h"
+#include "ZoneFinder.h"
 
 // ---- crash diagnostics: a vectored handler that writes where we died to reboot.log (the minidump from Wine has no usable callstack) ----
 inline const char* gBotBreadcrumb = "none";
@@ -101,28 +102,52 @@ inline void BotLogRegisters(PCONTEXT Context)
 }
 
 inline std::atomic<DWORD> gIgnoreFaultsThread = 0; // the hang watchdog while it copies another thread's stack (it reads past the end on purpose)
+inline thread_local bool gInFaultLogger = false;   // stops a fault inside the logger from recursively logging itself
+
+// A stale pointer that is dereferenced every tick faults every tick. Logging each one produced 40 identical
+// lines in a few seconds and made the "crash count" of a match meaningless. Remember the last few signatures
+// per thread and only report each distinct one once per window.
+struct BotFaultSignature { DWORD Code; uint64_t Rip; uint64_t BadAddress; int Bot; uint64_t AtMs; };
+inline thread_local BotFaultSignature gRecentFaults[16]{};
+inline thread_local int gRecentFaultCount = 0;
 
 inline LONG CALLBACK BotVectoredExceptionHandler(PEXCEPTION_POINTERS Info)
 {
 	const DWORD Code = Info->ExceptionRecord->ExceptionCode;
 
-	if (gIgnoreFaultsThread.load() == GetCurrentThreadId())
+	if (gInFaultLogger || gIgnoreFaultsThread.load() == GetCurrentThreadId())
 		return EXCEPTION_CONTINUE_SEARCH;
 
 	// access violation, illegal instruction, int divide by zero, stack overflow
 	if (Code != 0xC0000005 && Code != 0xC000001D && Code != 0xC0000094 && Code != 0xC00000FD)
 		return EXCEPTION_CONTINUE_SEARCH;
 
+	const uint64_t Rip = Info->ContextRecord->Rip;
+	const uint64_t BadAddress = (uint64_t)Info->ExceptionRecord->ExceptionInformation[1];
+	const uint64_t NowMs = GetTickCount64();
+
+	for (int i = 0; i < gRecentFaultCount; ++i)
+	{
+		const auto& Recent = gRecentFaults[i];
+		if (Recent.Code == Code && Recent.Rip == Rip && Recent.BadAddress == BadAddress
+			&& Recent.Bot == gBotBreadcrumbId && NowMs - Recent.AtMs < 10000)
+			return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	const int Slot = gRecentFaultCount < 16 ? gRecentFaultCount++ : 0;
+	gRecentFaults[Slot] = { Code, Rip, BadAddress, gBotBreadcrumbId, NowMs };
+
 	static int Reports = 0;
 
 	if (Reports++ >= 40)
 		return EXCEPTION_CONTINUE_SEARCH;
 
-	const uint64_t Rip = Info->ContextRecord->Rip;
 	const uint64_t Rsp = Info->ContextRecord->Rsp;
 
+	gInFaultLogger = true;
+
 	LOG_ERROR(LogBots, "CRASHLOG exception 0x{:x} rip=0x{:x} ({}) info0={} info1=0x{:x} breadcrumb='{}' bot={}", Code, Rip, BotModuleOffset(Rip),
-		(uint64_t)Info->ExceptionRecord->ExceptionInformation[0], (uint64_t)Info->ExceptionRecord->ExceptionInformation[1], gBotBreadcrumb, gBotBreadcrumbId);
+		(uint64_t)Info->ExceptionRecord->ExceptionInformation[0], BadAddress, gBotBreadcrumb, gBotBreadcrumbId);
 
 	// only for crashes in the game's own code (a probe of ours that faults on purpose would flood the log otherwise)
 	if (BotModuleOffset(Rip).rfind("FortniteClient", 0) == 0) BotLogRegisters(Info->ContextRecord);
@@ -134,6 +159,8 @@ inline LONG CALLBACK BotVectoredExceptionHandler(PEXCEPTION_POINTERS Info)
 		LOG_ERROR(LogBots, "CRASHLOG   stack[{}] {}", i, BotModuleOffset(Frames[i]));
 
 	spdlog::apply_all([](std::shared_ptr<spdlog::logger> Logger) { Logger->flush(); });
+
+	gInFaultLogger = false;
 
 	return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -1250,6 +1277,11 @@ namespace Bots
 		gTest.bEnabled = gTest.bEnabled || Command.find(L"-bot_test") != std::wstring::npos;
 		gTest.bExit = gTest.bExit || Command.find(L"-bot_exit") != std::wstring::npos;
 		gTest.bNavBuild = gTest.bNavBuild || Command.find(L"-bot_navbuild") != std::wstring::npos;
+		// -BOT_NAVEXPERIMENT: read-only probe of the map's navigation system (NavProbe log).
+		// -BOT_NAVMESH: actually create the Athena mesh/invokers and route with it (grid stays as fallback).
+		gNavExperiment = gNavExperiment || Command.find(L"-bot_navexperiment") != std::wstring::npos;
+		gNavMesh = gNavMesh || Command.find(L"-bot_navmesh") != std::wstring::npos;
+		if (Command.find(L"-bot_nomesh") != std::wstring::npos) gNavMesh = false;
 
 		if (Number(L"-bot_count=", Value)) gTest.BotCount = (int)Value;
 		if (Number(L"-bot_fill=", Value)) gTest.FillTotal = (int)Value;
@@ -1820,6 +1852,117 @@ namespace Bots
 	}
 
 
+	// The client cook omits UNavCollision (NeedsLoadForClient is false), so static meshes contribute no
+	// geometry to the nav octree and the generated tiles are empty. This is the fix the STW/Zone code
+	// uses (ZoneHusks.cpp EnsureNavCollisions): give every navigation-relevant mesh the object its
+	// BodySetup expects, then make already-registered components refresh their cached relevancy.
+	static int EnsureNavCollisions()
+	{
+		static auto MeshClass = FindObject<UClass>(L"/Script/Engine.StaticMesh");
+		static auto NavCollisionClass = FindObject<UClass>(L"/Script/NavigationSystem.NavCollision");
+		static int NavCollisionOffset = FindOffsetStruct("/Script/Engine.StaticMesh", "NavCollision", false);
+		static int BodySetupOffset = FindOffsetStruct("/Script/Engine.StaticMesh", "BodySetup", false);
+		static int HasNavOffset = FindOffsetStruct("/Script/Engine.StaticMesh", "bHasNavigationData", false);
+
+		if (!MeshClass || !NavCollisionClass || NavCollisionOffset == -1 || BodySetupOffset == -1 || HasNavOffset == -1)
+			return 0;
+
+		int Created = 0;
+		uint8_t HasNavMask = 0;
+
+		for (auto Mesh : GetAllObjectsOfClass(MeshClass))
+		{
+			if (!Mesh || Mesh->GetName().starts_with("Default__"))
+				continue;
+
+			if (!HasNavMask) HasNavMask = GetFieldMask(Mesh->GetProperty("bHasNavigationData"));
+			if (!HasNavMask || !Mesh->ReadBitfieldValue(HasNavOffset, HasNavMask))
+				continue;
+			if (Mesh->Get<UObject*>(NavCollisionOffset) || !Mesh->Get<UObject*>(BodySetupOffset))
+				continue;
+
+			if (auto NavCollision = UGameplayStatics::SpawnObject(NavCollisionClass, Mesh))
+			{
+				Mesh->Get<UObject*>(NavCollisionOffset) = NavCollision;
+				++Created;
+			}
+		}
+
+		LOG_INFO(LogBots, "NavMesh: created UNavCollision for {} of the navigation-relevant static meshes", Created);
+		return Created;
+	}
+
+	// The STW unlock sequence that makes a client-exe server actually generate tiles: build the
+	// FortNavigationGraph, release the initial build lock and refresh the components' nav-relevancy
+	// cache. Copied from ZoneHusks.cpp (where it is proven on this exact build).
+	static bool NavSafeVirtualCall(void* Function, UObject* Object, void* Argument)
+	{
+		__try { ((void(*)(UObject*, void*))Function)(Object, Argument); return true; }
+		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	}
+
+	static void NavUnlock(UObject* NavSystem, UWorld* World, const FVector& Center, const FVector& Half)
+	{
+		static uint64_t LockOffset = 0;
+		if (!LockOffset)
+		{
+			// NavBuildingLockFlags: the byte the build lock lives in. ZoneHusks reads it from
+			// PrepareBoundsAndUnlock's disassembly; keep the 7.30 constant as the fallback.
+			LockOffset = 0x398;
+		}
+
+		const uint64_t Base = (uint64_t)GetModuleHandleW(0);
+		const uint64_t PrepareFns[] = { ZoneFinder::PrepareBoundsAndUnlock(), ZoneFinder::AthenaPrepareBoundsAndUnlock() };
+		const int BoundsOffset = ZoneFinder::NavSystemBoundsOffset();
+		void* PrepareSlot = nullptr;
+
+		for (int i = 0; NavSystem->VFTable && i < 0x200 && !PrepareSlot; ++i)
+			for (auto Fn : PrepareFns)
+				if (Fn && (uint64_t)NavSystem->VFTable[i] == Fn) PrepareSlot = NavSystem->VFTable[i];
+
+		LOG_INFO(LogBots, "NavMesh: PrepareBoundsAndUnlock {} (bounds copy 0x{:x})", PrepareSlot ? "found" : "NOT in vtable", BoundsOffset);
+
+		if (PrepareSlot && BoundsOffset > 0)
+		{
+			alignas(8) uint8_t Bounds[0x2c];
+			memcpy(Bounds, (uint8_t*)NavSystem + BoundsOffset, sizeof(Bounds));
+			*(FVector*)(Bounds + 0x04) = FVector(Center.X - Half.X, Center.Y - Half.Y, Center.Z - Half.Z);
+			*(FVector*)(Bounds + 0x10) = FVector(Center.X + Half.X, Center.Y + Half.Y, Center.Z + Half.Z);
+			Bounds[0x1c] = 1;
+
+			static int LevelOffset = World->GetOffset("PersistentLevel", false);
+			auto Level = LevelOffset != -1 ? World->Get<UObject*>(LevelOffset) : nullptr;
+			auto Item = Level ? GetItemByIndex(Level->InternalIndex) : nullptr;
+
+			if (Item && Item->SerialNumber == 0)
+				Item->SerialNumber = 0x40000000 + Level->InternalIndex;
+
+			*(int*)(Bounds + 0x24) = Level ? Level->InternalIndex : -1;
+			*(int*)(Bounds + 0x28) = Item ? Item->SerialNumber : 0;
+			LOG_INFO(LogBots, "NavMesh: bounds level {} (index {}, serial {})", Level ? Level->GetName() : std::string("NONE"), *(int*)(Bounds + 0x24), *(int*)(Bounds + 0x28));
+			NavSafeVirtualCall(PrepareSlot, NavSystem, Bounds);
+		}
+
+		uint8_t* Lock = LockOffset ? (uint8_t*)((uint8_t*)NavSystem + LockOffset) : nullptr;
+		if (Lock && *Lock)
+		{
+			void* ReleaseSlot = NavSystem->VFTable ? NavSystem->VFTable[ZoneFinder::Fixed730::NavReleaseInitialBuildingLockSlot / 8] : nullptr;
+			bool bInside = (uint64_t)ReleaseSlot >= Base && (uint64_t)ReleaseSlot < Base + 0x4000000;
+
+			if (bInside)
+			{
+				const bool bOk = NavSafeVirtualCall(ReleaseSlot, NavSystem, nullptr);
+				LOG_INFO(LogBots, "NavMesh: ReleaseInitialBuildingLock {} (lock 0x{:x} -> 0x{:x})", bOk ? "ran" : "FAULTED", (int)*Lock, (int)*Lock);
+			}
+
+			if (*Lock)
+			{
+				*Lock &= ~4;
+				LOG_INFO(LogBots, "NavMesh: cleared initial build lock bit by hand (now 0x{:x})", (int)*Lock);
+			}
+		}
+	}
+
 	// The navigation mesh for real (gNavMesh): the game's own Athena navigation system is created in the world, given one huge bounds volume, and
 	// every bot is registered as an "invoker" so tiles of mesh get built around it. Found by taking the engine apart (see the notes in the NavProbe experiment above).
 	static void NavMeshSetup(float Now, const std::vector<AFortPlayerPawnAthena*>& Pawns)
@@ -1849,6 +1992,9 @@ namespace Bots
 		{
 			bCreated = true;
 
+			// Without these the Recast tiles stay empty on a client-exe server.
+			EnsureNavCollisions();
+
 			UObject* Config = nullptr;
 
 			if (auto Settings = FindObject(L"/Script/FortniteGame.Default__AthenaAISettings"))
@@ -1869,13 +2015,33 @@ namespace Bots
 
 			if (!Config || NavSysOffset == -1 || memcmp(Code, Expected, sizeof(Expected)) != 0)
 			{
-				bFailed = true;
-				LOG_WARN(LogBots, "NavMesh: cannot set up (config {}, navigation system offset {}, function bytes match {}): the bots keep their own grid", (void*)Config, NavSysOffset, memcmp(Code, Expected, sizeof(Expected)) == 0);
-				return;
+				// The 0x24ae500 prologue is from a different engine build (it fails here). Fall back
+				// to creating the navigation system the way the STW/Zone code does: spawn the class
+				// directly and hand it to the world, then let the bounds/ready steps below do the rest.
+				static auto NavClass = FindObject<UClass>(L"/Script/FortniteGame.FortNavSystem");
+				if (!NavClass) NavClass = FindObject<UClass>(L"/Script/FortniteGame.AthenaNavSystem");
+				if (!NavClass) NavClass = FindObject<UClass>(L"/Script/NavigationSystem.NavigationSystemV1");
+				UObject* Spawned = (!NavClass || NavSysOffset == -1) ? nullptr : UGameplayStatics::SpawnObject(NavClass, World);
+
+				if (!Spawned)
+				{
+					bFailed = true;
+					LOG_WARN(LogBots, "NavMesh: cannot set up (config {}, navsys offset {}, AddNavigationSystem bytes match {}, spawned {}): bots keep their own grid",
+						(void*)Config, NavSysOffset, memcmp(Code, Expected, sizeof(Expected)) == 0, (void*)Spawned);
+					return;
+				}
+
+				World->Get<UObject*>(NavSysOffset) = Spawned;
+				LOG_INFO(LogBots, "NavMesh: spawned navigation system {} directly (AddNavigationSystem signature did not match)", Spawned->GetName());
+				Code = nullptr; // no engine function to call; the rest of the setup uses the object
 			}
 
-			using AddFn = void (*)(UObject*, uint8_t, UObject*, uint8_t);
-			((AddFn)Code)(World, 1, Config, 1);
+			if (Code)
+			{
+				using AddFn = void (*)(UObject*, uint8_t, UObject*, uint8_t);
+				((AddFn)Code)(World, 1, Config, 1);
+			}
+
 			UObject* NavSystem = World->Get<UObject*>(NavSysOffset);
 
 			if (!NavSystem)
@@ -1953,6 +2119,9 @@ namespace Bots
 
 				LOG_INFO(LogBots, "NavMesh: navigation system {} created, bounds volume {} (component bounds at offset {})", (void*)NavSystem, (void*)Volume, Found);
 			}
+
+			// Build the FortNavigationGraph and release the initial build lock so tiles can generate.
+			NavUnlock(NavSystem, World, FVector{ 0.0f, 0.0f, 0.0f }, FVector{ 250000.0f, 250000.0f, 60000.0f });
 		}
 
 		auto NavSystem = NavSysOffset != -1 ? World->Get<UObject*>(NavSysOffset) : nullptr;
@@ -2499,7 +2668,7 @@ namespace Bots
 			const wchar_t* Chars = Text.Data.Data;
 			const int Count = Text.Data.Num();
 
-			if (!Chars || Count <= 1 || Count > 200 || IsBadReadPtr(Chars, Count * sizeof(wchar_t)))
+			if (!Chars || Count <= 1 || Count > 200 || !RebootIsReadable(Chars, Count * sizeof(wchar_t)))
 				return std::string("(empty)");
 
 			std::string Narrow;
@@ -2819,7 +2988,7 @@ namespace Bots
 		uint8* TemplateObject = *(uint8**)(Template + 8);      // layout seen in the logs: [0] vtable, [8] object, [16] reference controller
 		uint8* TemplateController = *(uint8**)(Template + 16);
 
-		auto Readable = [](void* Pointer, size_t Size) { return Pointer && !IsBadReadPtr(Pointer, Size); };
+		auto Readable = [](void* Pointer, size_t Size) { return Pointer && RebootIsReadable(Pointer, Size); };
 
 		// the object: [0] vtable, [8] weak "this" (points at itself), [16] its controller, [24] the id as an FString
 		wchar_t* Text = nullptr;
@@ -3274,6 +3443,9 @@ namespace Bots
 
 	static void Tick()
 	{
+		// extreme bot-test diagnostics: kept in the code permanently, silent in normal matches
+		gBotDiag = TestOptions().bEnabled;
+
 		if (RebootConfig::Get().Bots.bEnabled)
 			PreloadBotHeroes(); // the coming bots' skins, a few at a time during warmup
 
@@ -3584,6 +3756,7 @@ namespace Bots
 			BOT_CRUMB("Tick:bot-brain", PlayerBot.Id);
 			const double BrainStart = PerfNowMs();
 			BotBrain::Update(PlayerBot.Brain, CurrentPawn, CurrentPlayerState, PlayerBot.Controller, Cast<AFortPlayerControllerAthena>(PlayerBot.Controller) ? Cast<AFortPlayerControllerAthena>(PlayerBot.Controller)->GetWorldInventory() : nullptr, PlayerBot.Id, GameState->GetGamePhase(), TickNow, PlayerBot.bJumpedFromBus, PerfNowMs() - FrameStart < gDecisionBudgetMs);
+
 			gPerf.BrainFrame += PerfNowMs() - BrainStart;
 
 			/* bool bShouldJumpFromBus = CurrentPlayerState->IsInAircraft(); // TODO (Milxnor) add a random percent thing

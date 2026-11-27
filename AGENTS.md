@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## What this is
-A Windows C++ **DLL** injected into a Fortnite game exe to turn it into a dedicated server ("Project Reboot"; this fork is "Adamantium": bots + Save the World + backend match flow). The DLL is loaded by an external launcher that is **not in this repo**. There is no app to run locally, no package manager, and **no test/lint/typecheck/codegen scripts** — do not invent them. Verification = build + run against a target game build + read `reboot.log`.
+A Windows C++ **DLL** injected into a Fortnite game exe to turn it into a dedicated server ("Project Reboot"; this fork is "Adamantium": bots + Save the World + backend match flow). The DLL is loaded by an external launcher that is **not in this repo**. There is no app to run locally and no package manager. Verification = build + run against a target game build + read `reboot.log`. The one exception is `tests/bot_rules_test.cpp`, a standalone g++ test for the pure bot decision rules in `Project Reboot 3.0/BotRules.h` (no game/DLL needed): `g++ -std=c++17 -O1 -Wall -Wextra -I"Project Reboot 3.0" -o /tmp/bot_rules_test tests/bot_rules_test.cpp && /tmp/bot_rules_test`. Do not invent other test/lint/typecheck/codegen scripts.
 
 ## Build (exact commands)
 - Primary: Visual Studio 2022 / MSVC **v143**, `x64`. CI source of truth is `.github/workflows/msbuild.yml`:

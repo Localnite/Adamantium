@@ -1835,7 +1835,7 @@ namespace Zone
 		for (int i = 0; i < Set.Num() && i < 8; ++i)
 		{
 			auto Data = Set.at(i);
-			if (!Data || IsBadReadPtr(Data, 8)) continue;
+			if (!Data || !RebootIsReadable(Data, 8)) continue;
 
 			static int GenOffset = Data->GetOffset("RuntimeGeneration", false);
 			static int RadiusOffset = -2;

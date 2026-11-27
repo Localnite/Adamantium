@@ -16,6 +16,27 @@ typedef char ANSICHAR;
 typedef uint32_t CodeSkipSizeType;
 typedef unsigned __int64 uint64;
 
+// IsBadReadPtr is not a safe probe under Wine: for an unmapped address it raises an access violation
+// (kernel32+0x20eef) instead of simply returning TRUE. That fault escaped the __try in BotBrain::IsLiveBuilding
+// and produced 40 CRASHLOG lines per stale cached actor. VirtualQuery never faults, so use it instead.
+inline bool RebootIsReadable(const void* Ptr, size_t Size)
+{
+	if (!Ptr || !Size) return false;
+
+	const uintptr_t First = (uintptr_t)Ptr;
+	const uintptr_t Last = First + Size - 1;
+	const uintptr_t PageMask = ~(uintptr_t)0xfff;
+
+	for (uintptr_t Page = First & PageMask; Page <= (Last & PageMask); Page += 0x1000)
+	{
+		MEMORY_BASIC_INFORMATION Info{};
+		if (!VirtualQuery((LPCVOID)Page, &Info, sizeof(Info))) return false;
+		if (Info.State != MEM_COMMIT || (Info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+	}
+
+	return true;
+}
+
 extern inline int Engine_Version = 0; // For example, 420, 421, etc. // Prevent using this when possible.
 extern inline double Fortnite_Version = 0; // For example, 4.1, 6.21, etc. // Prevent using this when possible.
 extern inline int Fortnite_CL = 0;
